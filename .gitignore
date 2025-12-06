@@ -1,0 +1,6 @@
+bin/
+coverage*.out
+*.log
+*.swp
+.DS_Store
+vendor/
