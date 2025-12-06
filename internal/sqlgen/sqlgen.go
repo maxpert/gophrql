@@ -148,15 +148,45 @@ func compileLinear(q *ast.Query) (string, error) {
 func compileAppend(main *ast.Query, appended *ast.Query, remaining []ast.Step) (string, error) {
 	// If trailing select exists, apply it to each branch to mirror snapshot shape.
 	var trailingSelect *ast.SelectStep
+	var filtered []ast.Step
 	for _, st := range remaining {
-		if sel, ok := st.(*ast.SelectStep); ok {
+		if sel, ok := st.(*ast.SelectStep); ok && trailingSelect == nil {
 			trailingSelect = sel
-			break
+			continue
 		}
+		filtered = append(filtered, st)
 	}
+	remaining = filtered
 
 	leftQuery := main
 	rightQuery := appended
+	var baseSelect []string
+	for _, st := range main.Steps {
+		if sel, ok := st.(*ast.SelectStep); ok {
+			for _, it := range sel.Items {
+				if it.As != "" {
+					baseSelect = append(baseSelect, fmt.Sprintf("%s AS %s", exprSQL(it.Expr), it.As))
+				} else {
+					baseSelect = append(baseSelect, exprSQL(it.Expr))
+				}
+			}
+			break
+		}
+	}
+	if len(baseSelect) == 0 {
+		for _, st := range appended.Steps {
+			if sel, ok := st.(*ast.SelectStep); ok {
+				for _, it := range sel.Items {
+					if it.As != "" {
+						baseSelect = append(baseSelect, fmt.Sprintf("%s AS %s", exprSQL(it.Expr), it.As))
+					} else {
+						baseSelect = append(baseSelect, exprSQL(it.Expr))
+					}
+				}
+				break
+			}
+		}
+	}
 	if trailingSelect != nil {
 		leftSteps := append([]ast.Step{}, main.Steps...)
 		leftSteps = append(leftSteps, trailingSelect)
@@ -196,7 +226,54 @@ FROM
 
 	// Apply any trailing steps; current tests only have select which is no-op for projected fields.
 	_ = remaining
-	return union, nil
+	if len(remaining) == 0 {
+		return union, nil
+	}
+
+	b := newBuilder("table_union")
+	if len(b.selects) == 0 && len(baseSelect) > 0 {
+		b.selects = append(b.selects, baseSelect...)
+	}
+	if trailingSelect != nil {
+		for _, it := range trailingSelect.Items {
+			if it.As != "" {
+				b.selects = append(b.selects, fmt.Sprintf("%s AS %s", b.exprSQL(it.Expr), it.As))
+			} else {
+				b.selects = append(b.selects, b.exprSQL(it.Expr))
+			}
+		}
+	}
+	for _, st := range remaining {
+		switch v := st.(type) {
+		case *ast.FilterStep:
+			b.filters = append(b.filters, b.exprSQL(v.Expr))
+		case *ast.SortStep:
+			for _, it := range v.Items {
+				dir := ""
+				if it.Desc {
+					dir = " DESC"
+				}
+				b.order = append(b.order, b.exprSQL(it.Expr)+dir)
+			}
+		case *ast.TakeStep:
+			b.limit = v.Limit
+			b.offset = v.Offset
+		case *ast.SelectStep:
+			b.selects = nil
+			for _, it := range v.Items {
+				if it.As != "" {
+					expr := b.exprSQL(it.Expr)
+					b.selects = append(b.selects, fmt.Sprintf("%s AS %s", expr, it.As))
+				} else {
+					b.selects = append(b.selects, b.exprSQL(it.Expr))
+				}
+			}
+		}
+	}
+
+	core := b.build()
+	final := "WITH table_union AS (\n" + indent(strings.TrimSpace(union), "  ") + "\n)\n" + core
+	return final, nil
 }
 
 func compileRemove(main *ast.Query, removed *ast.Query, remaining []ast.Step) (string, error) {

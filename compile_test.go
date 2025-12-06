@@ -106,6 +106,51 @@ ORDER BY
 `,
 		},
 		{
+			name: "append_select_simple_filter",
+			prql: `
+from invoices
+select { invoice_id, billing_country }
+append (
+  from invoices
+  select { invoice_id = ` + "`invoice_id`" + ` + 100, billing_country }
+)
+filter (billing_country | text.starts_with("I"))
+`,
+			wantSQL: `
+WITH table_union AS (
+SELECT
+  *
+FROM
+  (
+    SELECT
+      invoice_id,
+      billing_country
+    FROM
+      invoices
+  ) AS table_2
+UNION
+ALL
+SELECT
+  *
+FROM
+  (
+    SELECT
+      invoice_id + 100 AS invoice_id,
+      billing_country
+    FROM
+      invoices
+  ) AS table_3
+)
+SELECT
+  invoice_id,
+  billing_country
+FROM
+  table_union
+WHERE
+  billing_country LIKE CONCAT('I', '%')
+`,
+		},
+		{
 			name: "take_range_with_sort",
 			prql: `
 from tracks
