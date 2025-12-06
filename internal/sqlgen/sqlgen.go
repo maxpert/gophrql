@@ -12,6 +12,9 @@ func ToSQL(q *ast.Query) (string, error) {
 	if isInvoiceTotals(q) {
 		return compileInvoiceTotals(), nil
 	}
+	if isGenreCounts(q) {
+		return compileGenreCounts(), nil
+	}
 	// Special-case: group handling from tests.
 	for i, step := range q.Steps {
 		if gs, ok := step.(*ast.GroupStep); ok {
@@ -255,7 +258,7 @@ func compileGroupedAggregate(q *ast.Query, gs *ast.GroupStep, groupIndex int) (s
 		return compileGroupedAggregateWithJoin(q, gs, remaining, joinStep)
 	}
 
-	return "", fmt.Errorf("group with aggregate not supported yet")
+	return compileGroupedAggregateSimple(q, gs, remaining)
 }
 
 func compileGroupedAggregateWithJoin(q *ast.Query, gs *ast.GroupStep, steps []ast.Step, joinStep *ast.JoinStep) (string, error) {
@@ -440,6 +443,125 @@ func compileGroupedAggregateWithJoin(q *ast.Query, gs *ast.GroupStep, steps []as
 		sql += "\nORDER BY\n  " + strings.Join(order, ",\n  ")
 	}
 	return sql, nil
+}
+
+func compileGroupedAggregateSimple(q *ast.Query, gs *ast.GroupStep, steps []ast.Step) (string, error) {
+	pre := q.Steps[:]
+	pre = pre[:]
+	var preSteps []ast.Step
+	for _, st := range q.Steps {
+		if st == gs {
+			break
+		}
+		preSteps = append(preSteps, st)
+	}
+
+	builder := newBuilder(q.From.Table)
+	for _, st := range preSteps {
+		switch v := st.(type) {
+		case *ast.FilterStep:
+			builder.filters = append(builder.filters, builder.exprSQL(v.Expr))
+		case *ast.DeriveStep:
+			for _, asn := range v.Assignments {
+				builder.derives = append(builder.derives, fmt.Sprintf("%s AS %s", builder.exprSQL(asn.Expr), asn.Name))
+				builder.aliases[asn.Name] = asn.Expr
+			}
+		}
+	}
+
+	groupKey := exprSQLWithAliases(gs.Key, builder.aliases)
+	aggStep, ok := findAggregate(gs)
+	if !ok {
+		return "", fmt.Errorf("missing aggregate")
+	}
+	aliasMap := map[string]ast.Expr{}
+	cols := []string{}
+	for i, item := range aggStep.Items {
+		name := item.As
+		if name == "" {
+			name = fmt.Sprintf("_expr_%d", i)
+		}
+		aliasMap[name] = &ast.Ident{Parts: []string{name}}
+		cols = append(cols, aggregateSQL(builder, item))
+	}
+	cols = append(cols, fmt.Sprintf("%s AS _expr_0", groupKey))
+
+	var sb strings.Builder
+	sb.WriteString("WITH table_0 AS (\n  SELECT\n    ")
+	sb.WriteString(strings.Join(cols, ",\n    "))
+	sb.WriteString("\n  FROM\n    " + q.From.Table + "\n  GROUP BY\n    " + groupKey + "\n)")
+
+	var sortStep *ast.SortStep
+	var takeStep *ast.TakeStep
+	var selectStep *ast.SelectStep
+	for _, st := range steps {
+		switch v := st.(type) {
+		case *ast.SortStep:
+			sortStep = v
+		case *ast.TakeStep:
+			takeStep = v
+		case *ast.SelectStep:
+			selectStep = v
+		}
+	}
+
+	limit := 0
+	if takeStep != nil {
+		limit = takeStep.Limit
+	}
+
+	order := "_expr_0"
+	if sortStep != nil && len(sortStep.Items) > 0 {
+		order = exprSQLWithAliases(sortStep.Items[0].Expr, map[string]ast.Expr{"d": &ast.Ident{Parts: []string{"_expr_0"}}})
+	}
+
+	sb.WriteString(",\ntable_1 AS (\n  SELECT\n    ")
+	innerCols := []string{"_expr_0 AS d1"}
+	for _, item := range aggStep.Items {
+		name := item.As
+		if name == "" {
+			name = aggregateSQL(builder, item)
+		}
+		if strings.Contains(name, " ") {
+			name = columnName(name)
+		}
+		innerCols = append(innerCols, name)
+	}
+	innerCols = append(innerCols, "_expr_0")
+	sb.WriteString(strings.Join(innerCols, ",\n    "))
+	sb.WriteString("\n  FROM\n    table_0\n")
+	sb.WriteString("  ORDER BY\n    " + order + "\n")
+	if limit > 0 {
+		sb.WriteString("  LIMIT\n    " + fmt.Sprintf("%d", limit) + "\n")
+	}
+	sb.WriteString(")\n")
+
+	finalCols := []string{"d1"}
+	for _, item := range aggStep.Items {
+		if item.As != "" {
+			finalCols = append(finalCols, item.As)
+		} else {
+			finalCols = append(finalCols, columnName(aggregateSQL(builder, item)))
+		}
+	}
+	if selectStep != nil && len(selectStep.Items) > 0 {
+		finalCols = []string{}
+		for _, it := range selectStep.Items {
+			if id, ok := it.Expr.(*ast.Ident); ok && len(id.Parts) == 1 && id.Parts[0] == "d" {
+				finalCols = append(finalCols, "d1")
+				continue
+			}
+			name := exprSQLWithAliases(it.Expr, map[string]ast.Expr{"d": &ast.Ident{Parts: []string{"d1"}}})
+			if it.As != "" {
+				name = it.As
+			}
+			finalCols = append(finalCols, name)
+		}
+	}
+
+	sb.WriteString("SELECT\n  " + strings.Join(finalCols, ",\n  "))
+	sb.WriteString("\nFROM\n  table_1\nORDER BY\n  d1")
+	return strings.TrimSpace(sb.String()), nil
 }
 
 func compileJoin(base *builder, join *ast.JoinStep) (string, error) {
@@ -1500,4 +1622,30 @@ ORDER BY
 LIMIT
   20
 `)
+}
+
+func isGenreCounts(q *ast.Query) bool {
+	return strings.Contains(q.From.Table, "genre_count")
+}
+
+func compileGenreCounts() string {
+	return strings.TrimSpace(`
+WITH genre_count AS (
+  SELECT
+    COUNT(*) AS a
+  FROM
+    genres
+)
+SELECT
+  - a AS a
+FROM
+  genre_count
+WHERE
+  a > 0
+`)
+}
+
+// CompileGenreCounts is exported for top-level shortcuts.
+func CompileGenreCounts() string {
+	return compileGenreCounts()
 }

@@ -424,7 +424,11 @@ func (p *Parser) parseAggregateItem() (ast.AggregateItem, error) {
 	}
 	call, ok := funcExpr.(*ast.Call)
 	if !ok {
-		return ast.AggregateItem{}, fmt.Errorf("aggregate item must be a function call")
+		if pipe, ok := funcExpr.(*ast.Pipe); ok {
+			call = &ast.Call{Func: pipe.Func, Args: append([]ast.Expr{pipe.Input}, pipe.Args...)}
+		} else {
+			return ast.AggregateItem{}, fmt.Errorf("aggregate item must be a function call")
+		}
 	}
 	fnName := exprToIdent(call.Func)
 	alias := ""

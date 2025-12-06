@@ -34,6 +34,78 @@ WHERE
 `,
 		},
 		{
+			name: "genre_counts",
+			prql: `
+let genre_count = (
+    from genres
+    aggregate {a = count name}
+)
+
+from genre_count
+filter a > 0
+select a = -a
+`,
+			wantSQL: `
+WITH genre_count AS (
+  SELECT
+    COUNT(*) AS a
+  FROM
+    genres
+)
+SELECT
+  - a AS a
+FROM
+  genre_count
+WHERE
+  a > 0
+`,
+		},
+		{
+			name: "group_sort_basic",
+			prql: `
+from tracks
+derive d = album_id + 1
+group d (
+    aggregate {
+        n1 = (track_id | sum),
+    }
+)
+sort d
+take 10
+select { d1 = d, n1 }
+`,
+			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    COALESCE(SUM(track_id), 0) AS n1,
+    album_id + 1 AS _expr_0
+  FROM
+    tracks
+  GROUP BY
+    album_id + 1
+),
+table_1 AS (
+  SELECT
+    _expr_0 AS d1,
+    n1,
+    _expr_0
+  FROM
+    table_0
+  ORDER BY
+    _expr_0
+  LIMIT
+    10
+)
+SELECT
+  d1,
+  n1
+FROM
+  table_1
+ORDER BY
+  d1
+`,
+		},
+		{
 			name: "append_select_union",
 			prql: `
 from invoices
