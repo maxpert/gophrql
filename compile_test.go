@@ -496,9 +496,124 @@ SELECT
   artist_name
 FROM
   table_3
-ORDER BY
+ ORDER BY
   artist_id,
   new_album_count
+`,
+		},
+		{
+			name: "cast_projection",
+			prql: `
+from tracks
+sort {-bytes}
+select {
+    name,
+    bin = ((album_id | as REAL) * 99)
+}
+take 20
+`,
+			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    name,
+    CAST(album_id AS REAL) * 99 AS bin,
+    bytes
+  FROM
+    tracks
+  ORDER BY
+    bytes DESC
+  LIMIT
+    20
+)
+SELECT
+  name,
+  bin
+FROM
+  table_0
+ORDER BY
+  bytes DESC
+`,
+		},
+		{
+			name: "distinct_on_group_sort_take",
+			prql: `
+from tracks
+select {genre_id, media_type_id, album_id}
+group {genre_id, media_type_id} (sort {-album_id} | take 1)
+sort {-genre_id, media_type_id}
+`,
+			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    genre_id,
+    media_type_id,
+    album_id,
+    ROW_NUMBER() OVER (
+      PARTITION BY genre_id,
+      media_type_id
+      ORDER BY
+        album_id DESC
+    ) AS _expr_0
+  FROM
+    tracks
+)
+SELECT
+  genre_id,
+  media_type_id,
+  album_id
+FROM
+  table_0
+WHERE
+  _expr_0 <= 1
+ORDER BY
+  genre_id DESC,
+  media_type_id
+`,
+		},
+		{
+			name: "group_sort_limit_take_join",
+			prql: `
+from tracks
+select {genre_id,milliseconds}
+group {genre_id} (
+  sort {-milliseconds}
+  take 3
+)
+join genres (==genre_id)
+select {name, milliseconds}
+sort {+name,-milliseconds}
+`,
+			wantSQL: `
+WITH table_1 AS (
+  SELECT
+    milliseconds,
+    genre_id,
+    ROW_NUMBER() OVER (
+      PARTITION BY genre_id
+      ORDER BY
+        milliseconds DESC
+    ) AS _expr_0
+  FROM
+    tracks
+),
+table_0 AS (
+  SELECT
+    milliseconds,
+    genre_id
+  FROM
+    table_1
+  WHERE
+    _expr_0 <= 3
+)
+SELECT
+  genres.name,
+  table_0.milliseconds
+FROM
+  table_0
+  INNER JOIN genres ON table_0.genre_id = genres.genre_id
+ORDER BY
+  genres.name,
+  table_0.milliseconds DESC
 `,
 		},
 	}

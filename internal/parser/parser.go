@@ -553,6 +553,10 @@ func (p *Parser) parseGroupSteps() ([]ast.Step, error) {
 		if p.peekIs(EOF) {
 			break
 		}
+		if p.peekIs(PIPE) {
+			p.next()
+			continue
+		}
 		switch tok := p.peek(); tok.Typ {
 		case IDENT:
 			switch tok.Lit {
@@ -617,6 +621,9 @@ func (p *Parser) parseSort() (ast.Step, error) {
 		p.next()
 		for {
 			p.skipNewlines()
+			if p.peekIs(PIPE) {
+				break
+			}
 			if p.peekIs(RBRACE) {
 				p.next()
 				break
@@ -632,13 +639,15 @@ func (p *Parser) parseSort() (ast.Step, error) {
 			p.skipNewlines()
 		}
 	} else {
+		if p.peekIs(PIPE) {
+			return &ast.SortStep{Items: items}, nil
+		}
 		item, err := p.parseSortItem()
 		if err != nil {
 			return nil, err
 		}
 		items = append(items, item)
 	}
-	p.skipToLineEnd()
 	return &ast.SortStep{Items: items}, nil
 }
 
@@ -647,6 +656,8 @@ func (p *Parser) parseSortItem() (ast.SortItem, error) {
 	if p.peekIs(MINUS) {
 		p.next()
 		desc = true
+	} else if p.peekIs(PLUS) {
+		p.next()
 	}
 	expr, err := p.parseExpr(0)
 	if err != nil {
@@ -888,20 +899,26 @@ func appendCallArg(fn ast.Expr, arg ast.Expr) ast.Expr {
 
 func (p *Parser) parseJoin() (ast.Step, error) {
 	p.skipNewlines()
-	side := "left"
+	side := "inner"
 	if p.peekIs(IDENT) && strings.Contains(p.peek().Lit, "side:") {
 		side = strings.SplitN(p.next().Lit, ":", 2)[1]
 	}
 	p.skipNewlines()
-	if !p.peekIs(LPAREN) {
+	var subQuery *ast.Query
+	if p.peekIs(LPAREN) {
+		p.next()
+		subTokens := p.collectUntilMatching(RPAREN)
+		subParser := &Parser{tokens: subTokens}
+		q, err := subParser.parseQuery()
+		if err != nil {
+			return nil, err
+		}
+		subQuery = q
+	} else if p.peekIs(IDENT) {
+		table := p.next().Lit
+		subQuery = &ast.Query{From: ast.Source{Table: table}}
+	} else {
 		return nil, fmt.Errorf("join expects '(' source")
-	}
-	p.next()
-	subTokens := p.collectUntilMatching(RPAREN)
-	subParser := &Parser{tokens: subTokens}
-	subQuery, err := subParser.parseQuery()
-	if err != nil {
-		return nil, err
 	}
 	p.skipNewlines()
 	if !p.peekIs(LPAREN) {
@@ -909,10 +926,23 @@ func (p *Parser) parseJoin() (ast.Step, error) {
 	}
 	p.next()
 	condTokens := p.collectUntilMatching(RPAREN)
-	condParser := &Parser{tokens: condTokens}
-	cond, err := condParser.parseExpr(0)
-	if err != nil {
-		return nil, err
+	var cond ast.Expr
+	if len(condTokens) > 0 && condTokens[0].Typ == EQ && len(condTokens) > 1 && condTokens[1].Typ == IDENT {
+		name := condTokens[1].Lit
+		cond = &ast.Binary{
+			Op:   "==",
+			Left: &ast.Ident{Parts: []string{"this", name}},
+			Right: &ast.Ident{
+				Parts: []string{"that", name},
+			},
+		}
+	} else {
+		condParser := &Parser{tokens: condTokens}
+		var err error
+		cond, err = condParser.parseExpr(0)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &ast.JoinStep{Side: side, Query: subQuery, On: cond}, nil
 }

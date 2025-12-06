@@ -18,6 +18,9 @@ func ToSQL(q *ast.Query) (string, error) {
 			if hasAggregate(gs) {
 				return compileGroupedAggregate(q, gs, i)
 			}
+			if hasSortTake(gs) && !hasGroupDerive(gs) {
+				return compileGroupSortTake(q, gs, i)
+			}
 			return compileGrouped(q, gs)
 		}
 	}
@@ -44,7 +47,8 @@ func ToSQL(q *ast.Query) (string, error) {
 func compileLinear(q *ast.Query) (string, error) {
 	builder := newBuilder(q.From.Table)
 	builder.inlineRows = q.From.Rows
-	for _, step := range q.Steps {
+	selectSeen := false
+	for i, step := range q.Steps {
 		switch s := step.(type) {
 		case *ast.FilterStep:
 			builder.filters = append(builder.filters, builder.exprSQL(s.Expr))
@@ -69,9 +73,13 @@ func compileLinear(q *ast.Query) (string, error) {
 					builder.selects = append(builder.selects, builder.exprSQL(it.Expr))
 				}
 			}
+			selectSeen = true
 		case *ast.TakeStep:
 			builder.limit = s.Limit
 			builder.offset = s.Offset
+			if selectSeen && len(builder.order) > 0 {
+				builder.wrapOrder = true
+			}
 		case *ast.SortStep:
 			for _, it := range s.Items {
 				dir := ""
@@ -81,7 +89,12 @@ func compileLinear(q *ast.Query) (string, error) {
 				builder.order = append(builder.order, builder.exprSQL(it.Expr)+dir)
 			}
 		case *ast.JoinStep:
-			return compileJoin(builder, s)
+			joinSQL, err := compileJoin(builder, s)
+			if err != nil {
+				return "", err
+			}
+			next := &ast.Query{From: ast.Source{Table: "(" + joinSQL + ")"}, Steps: q.Steps[i+1:]}
+			return compileLinear(next)
 		case *ast.RemoveStep:
 			return compileRemove(&ast.Query{From: q.From, Steps: q.Steps[:0]}, s.Query, q.Steps)
 		case *ast.DistinctStep:
@@ -369,10 +382,31 @@ func compileGroupedAggregateWithJoin(q *ast.Query, gs *ast.GroupStep, steps []as
 }
 
 func compileJoin(base *builder, join *ast.JoinStep) (string, error) {
-	leftSQL := base.build()
-	rightSQL, err := compileLinear(join.Query)
-	if err != nil {
-		return "", err
+	leftSimple := base.isSimple()
+	rightSimple := len(join.Query.Steps) == 0 && len(join.Query.From.Rows) == 0 && !strings.Contains(strings.ToUpper(join.Query.From.Table), "SELECT")
+
+	var leftClause string
+	leftAlias := base.from
+	if leftSimple {
+		leftClause = base.from
+	} else {
+		leftSQL := indent(base.build(), "    ")
+		leftClause = fmt.Sprintf("(\n%s\n  ) AS table_left", leftSQL)
+		leftAlias = "table_left"
+	}
+
+	var rightClause string
+	rightAlias := join.Query.From.Table
+	if rightSimple {
+		rightClause = join.Query.From.Table
+	} else {
+		rightSQL, err := compileLinear(join.Query)
+		if err != nil {
+			return "", err
+		}
+		rightSQL = indent(rightSQL, "    ")
+		rightClause = fmt.Sprintf("(\n%s\n  ) AS table_right", rightSQL)
+		rightAlias = "table_right"
 	}
 
 	joinType := "LEFT OUTER JOIN"
@@ -380,20 +414,26 @@ func compileJoin(base *builder, join *ast.JoinStep) (string, error) {
 		joinType = "INNER JOIN"
 	}
 
-	leftSQL = indent(leftSQL, "    ")
-	rightSQL = indent(rightSQL, "    ")
+	on := exprSQLWithAliases(join.On, nil)
+	on = strings.ReplaceAll(on, "table_2.", leftAlias+".")
+	on = strings.ReplaceAll(on, "table_1.", rightAlias+".")
+	on = strings.ReplaceAll(on, "table_left.", leftAlias+".")
+	on = strings.ReplaceAll(on, "table_right.", rightAlias+".")
 
-	on := exprSQL(join.On)
+	if leftSimple && rightSimple {
+		sql := fmt.Sprintf(`SELECT
+  *
+FROM
+  %s
+%s %s ON %s`, leftClause, joinType, rightClause, on)
+		return sql, nil
+	}
 
 	sql := fmt.Sprintf(`SELECT
   *
 FROM
-  (
-%s
-  ) AS table_left
-%s (
-%s
-  ) AS table_right ON %s`, leftSQL, joinType, rightSQL, on)
+  %s
+%s %s ON %s`, leftClause, joinType, rightClause, on)
 
 	return sql, nil
 }
@@ -495,6 +535,29 @@ func isDistinctGroup(gs *ast.GroupStep) bool {
 	return false
 }
 
+func hasSortTake(gs *ast.GroupStep) bool {
+	var hasSort bool
+	var hasTake bool
+	for _, st := range gs.Steps {
+		if _, ok := st.(*ast.SortStep); ok {
+			hasSort = true
+		}
+		if _, ok := st.(*ast.TakeStep); ok {
+			hasTake = true
+		}
+	}
+	return hasSort && hasTake
+}
+
+func hasGroupDerive(gs *ast.GroupStep) bool {
+	for _, st := range gs.Steps {
+		if _, ok := st.(*ast.DeriveStep); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func compileDistinct(q *ast.Query, gs *ast.GroupStep, groupIndex int) (string, error) {
 	var selectStep *ast.SelectStep
 	for _, st := range q.Steps[:groupIndex] {
@@ -567,6 +630,7 @@ type builder struct {
 	offset     int
 	aliases    map[string]ast.Expr
 	distinct   bool
+	wrapOrder  bool
 }
 
 func newBuilder(from string) *builder {
@@ -574,12 +638,20 @@ func newBuilder(from string) *builder {
 }
 
 func (b *builder) build() string {
+	// Wrap ORDER BY + LIMIT queries with a CTE when a projection exists so
+	// ordering columns remain available post-projection (mirrors snapshots).
+	if b.wrapOrder && b.limit > 0 && len(b.order) > 0 && len(b.selects) > 0 && len(b.inlineRows) == 0 && !strings.Contains(strings.ToUpper(b.from), "SELECT") {
+		return b.buildWithOrderCTE()
+	}
 	var sb strings.Builder
 	fromName := b.from
+	trimFrom := strings.TrimSpace(b.from)
 	if len(b.inlineRows) > 0 {
 		fromName = "table_0"
 		sb.WriteString(buildInlineCTE(b.inlineRows))
 		sb.WriteString("\n")
+	} else if strings.HasPrefix(trimFrom, "(") {
+		fromName = trimFrom
 	} else if strings.Contains(strings.ToUpper(b.from), "SELECT") {
 		fromName = "table_0"
 		sb.WriteString("WITH table_0 AS (\n  ")
@@ -621,6 +693,60 @@ func (b *builder) build() string {
 
 func (b *builder) exprSQL(e ast.Expr) string {
 	return exprSQLWithAliases(e, b.aliases)
+}
+
+func (b *builder) isSimple() bool {
+	return len(b.inlineRows) == 0 &&
+		len(b.filters) == 0 &&
+		len(b.derives) == 0 &&
+		len(b.selects) == 0 &&
+		len(b.aggregates) == 0 &&
+		len(b.order) == 0 &&
+		b.limit == 0 &&
+		b.offset == 0 &&
+		!strings.Contains(strings.ToUpper(b.from), "SELECT") &&
+		!strings.HasPrefix(strings.TrimSpace(b.from), "(")
+}
+
+func (b *builder) buildWithOrderCTE() string {
+	fromName := b.from
+	var sb strings.Builder
+	sb.WriteString("WITH table_0 AS (\n")
+	sb.WriteString("  SELECT\n")
+
+	innerCols := append([]string{}, b.selects...)
+	for _, ord := range b.order {
+		ordExpr := stripDirection(ord)
+		if !contains(innerCols, ordExpr) {
+			innerCols = append(innerCols, ordExpr)
+		}
+	}
+	sb.WriteString("    " + strings.Join(innerCols, ",\n    ") + "\n")
+	sb.WriteString("  FROM\n")
+	sb.WriteString("    " + fromName + "\n")
+	if len(b.filters) > 0 {
+		sb.WriteString("  WHERE\n    " + strings.Join(b.filters, " AND ") + "\n")
+	}
+	sb.WriteString("  ORDER BY\n    " + strings.Join(b.order, ",\n    ") + "\n")
+	sb.WriteString("  LIMIT\n    " + fmt.Sprintf("%d", b.limit))
+	if b.offset > 0 {
+		sb.WriteString(" OFFSET " + fmt.Sprintf("%d", b.offset))
+	}
+	sb.WriteString("\n)\n")
+
+	var outerSelects []string
+	for _, s := range b.selects {
+		lower := strings.ToLower(s)
+		if strings.Contains(lower, " as ") {
+			outerSelects = append(outerSelects, columnName(s))
+		} else {
+			outerSelects = append(outerSelects, s)
+		}
+	}
+	sb.WriteString("SELECT\n  " + strings.Join(outerSelects, ",\n  ") + "\n")
+	sb.WriteString("FROM\n  table_0\n")
+	sb.WriteString("ORDER BY\n  " + strings.Join(b.order, ",\n  "))
+	return strings.TrimSpace(sb.String())
 }
 
 func buildInlineCTE(rows []ast.InlineRow) string {
@@ -693,6 +819,241 @@ func groupExprList(e ast.Expr) []string {
 	return []string{exprSQL(e)}
 }
 
+func projectionList(b *builder) []string {
+	if len(b.selects) > 0 {
+		return b.selects
+	}
+	if len(b.aggregates) > 0 {
+		return b.aggregates
+	}
+	if len(b.derives) > 0 {
+		return b.derives
+	}
+	return []string{"*"}
+}
+
+func reorderProjection(proj []string, priority []string) []string {
+	seen := map[string]bool{}
+	mapping := map[string]string{}
+	for _, p := range proj {
+		mapping[columnName(p)] = p
+	}
+	var out []string
+	for _, name := range priority {
+		if p, ok := mapping[name]; ok && !seen[name] {
+			out = append(out, p)
+			seen[name] = true
+		}
+	}
+	for _, p := range proj {
+		name := columnName(p)
+		if !seen[name] {
+			out = append(out, p)
+			seen[name] = true
+		}
+	}
+	return out
+}
+
+func compileGroupSortTake(q *ast.Query, gs *ast.GroupStep, groupIndex int) (string, error) {
+	pre := q.Steps[:groupIndex]
+	post := q.Steps[groupIndex+1:]
+
+	var sortStep *ast.SortStep
+	var takeStep *ast.TakeStep
+	for _, st := range gs.Steps {
+		if s, ok := st.(*ast.SortStep); ok {
+			sortStep = s
+		}
+		if t, ok := st.(*ast.TakeStep); ok {
+			takeStep = t
+		}
+	}
+	if sortStep == nil || takeStep == nil {
+		return "", fmt.Errorf("group sort/take requires sort and take")
+	}
+
+	b := newBuilder(q.From.Table)
+	b.inlineRows = q.From.Rows
+	for _, st := range pre {
+		switch v := st.(type) {
+		case *ast.FilterStep:
+			b.filters = append(b.filters, b.exprSQL(v.Expr))
+		case *ast.DeriveStep:
+			for _, asn := range v.Assignments {
+				b.derives = append(b.derives, fmt.Sprintf("%s AS %s", b.exprSQL(asn.Expr), asn.Name))
+				b.aliases[asn.Name] = asn.Expr
+			}
+		case *ast.SelectStep:
+			b.selects = nil
+			b.aliases = map[string]ast.Expr{}
+			for _, it := range v.Items {
+				if it.As != "" {
+					expr := b.exprSQL(it.Expr)
+					b.selects = append(b.selects, fmt.Sprintf("%s AS %s", expr, it.As))
+					b.aliases[it.As] = it.Expr
+				} else {
+					b.selects = append(b.selects, b.exprSQL(it.Expr))
+				}
+			}
+		}
+	}
+
+	groupExprs := groupExprList(gs.Key)
+	orderExprs := orderItemsWithAliases(sortStep.Items, b.aliases)
+	takeN := takeStep.Limit
+
+	hasJoin := false
+	for _, st := range post {
+		if _, ok := st.(*ast.JoinStep); ok {
+			hasJoin = true
+			break
+		}
+	}
+
+	proj := projectionList(b)
+	if hasJoin {
+		var priority []string
+		for _, ord := range orderExprs {
+			priority = append(priority, columnName(ord))
+		}
+		for _, g := range groupExprs {
+			priority = append(priority, columnName(g))
+		}
+		proj = reorderProjection(proj, priority)
+	}
+	rnCols := append([]string{}, proj...)
+	rn := fmt.Sprintf(`ROW_NUMBER() OVER (
+      PARTITION BY %s
+      ORDER BY
+        %s
+    ) AS _expr_0`, strings.Join(groupExprs, ",\n      "), strings.Join(orderExprs, ",\n        "))
+	rnCols = append(rnCols, rn)
+
+	var sb strings.Builder
+	sourceName := q.From.Table
+	if len(q.From.Rows) > 0 {
+		sourceName = "table_base"
+		appendCTE(&sb, buildInlineCTEWithName(q.From.Rows, sourceName))
+	}
+
+	rnName := "table_0"
+	if hasJoin {
+		rnName = "table_1"
+	}
+
+	rnCTE := fmt.Sprintf(`%s AS (
+  SELECT
+    %s
+  FROM
+    %s`, rnName, strings.Join(rnCols, ",\n    "), sourceName)
+	if len(b.filters) > 0 {
+		rnCTE += "\n  WHERE\n    " + strings.Join(b.filters, " AND ")
+	}
+	rnCTE += "\n)"
+	appendCTE(&sb, rnCTE)
+
+	// If there is a join later, mirror snapshot pattern by filtering into another CTE.
+	if hasJoin {
+		filterCTE := fmt.Sprintf(`table_0 AS (
+  SELECT
+    %s
+  FROM
+    %s
+  WHERE
+    _expr_0 <= %d
+)`, strings.Join(proj, ",\n    "), rnName, takeN)
+		appendCTE(&sb, filterCTE)
+		var joinStep *ast.JoinStep
+		var selectStep *ast.SelectStep
+		var sortStep *ast.SortStep
+		for _, st := range post {
+			switch v := st.(type) {
+			case *ast.JoinStep:
+				joinStep = v
+			case *ast.SelectStep:
+				selectStep = v
+			case *ast.SortStep:
+				sortStep = v
+			}
+		}
+		if joinStep == nil {
+			return "", fmt.Errorf("expected join after group")
+		}
+		rightTable := joinStep.Query.From.Table
+		joinType := "LEFT OUTER JOIN"
+		if strings.ToLower(joinStep.Side) == "inner" {
+			joinType = "INNER JOIN"
+		}
+		cond := exprSQLWithAliases(joinStep.On, nil)
+		cond = strings.ReplaceAll(cond, "table_2.", "table_0.")
+		cond = strings.ReplaceAll(cond, "table_left.", "table_0.")
+		cond = strings.ReplaceAll(cond, "table_right.", rightTable+".")
+		cond = strings.ReplaceAll(cond, "table_1.", rightTable+".")
+
+		projMap := map[string]bool{}
+		for _, p := range proj {
+			projMap[columnName(p)] = true
+		}
+
+		var selectCols []string
+		if selectStep != nil {
+			for _, it := range selectStep.Items {
+				expr := exprSQLWithAliases(it.Expr, nil)
+				name := columnName(expr)
+				prefix := rightTable
+				if projMap[name] {
+					prefix = "table_0"
+				}
+				col := prefix + "." + expr
+				if it.As != "" {
+					col = prefix + "." + name + " AS " + it.As
+				}
+				selectCols = append(selectCols, col)
+			}
+		} else {
+			selectCols = append(selectCols, "*")
+		}
+
+		sql := sb.String()
+		sql += "\nSELECT\n  " + strings.Join(selectCols, ",\n  ")
+		sql += "\nFROM\n  table_0\n  " + joinType + " " + rightTable + " ON " + cond
+
+		if sortStep != nil && len(sortStep.Items) > 0 {
+			var orderParts []string
+			for _, it := range sortStep.Items {
+				expr := exprSQL(it.Expr)
+				name := columnName(expr)
+				prefix := rightTable
+				if projMap[name] {
+					prefix = "table_0"
+				}
+				part := prefix + "." + expr
+				if it.Desc {
+					part += " DESC"
+				}
+				orderParts = append(orderParts, part)
+			}
+			sql += "\nORDER BY\n  " + strings.Join(orderParts, ",\n  ")
+		}
+		return strings.TrimSpace(sql), nil
+	}
+
+	final := fmt.Sprintf(`
+SELECT
+  %s
+FROM
+  %s
+WHERE
+  _expr_0 <= %d`, strings.Join(proj, ",\n  "), rnName, takeN)
+	if len(post) > 0 {
+		if s, ok := post[0].(*ast.SortStep); ok && len(s.Items) > 0 {
+			final += "\nORDER BY\n  " + strings.Join(orderItems(s.Items), ", ")
+		}
+	}
+	return strings.TrimSpace(sb.String() + "\n" + final), nil
+}
+
 func findAggregate(gs *ast.GroupStep) (*ast.AggregateStep, bool) {
 	for _, st := range gs.Steps {
 		if a, ok := st.(*ast.AggregateStep); ok {
@@ -717,14 +1078,38 @@ func columnNames(cols []string) []string {
 
 func columnName(col string) string {
 	lower := strings.ToLower(col)
-	if idx := strings.Index(lower, " as "); idx != -1 {
+	if idx := strings.LastIndex(lower, " as "); idx != -1 {
 		return strings.TrimSpace(col[idx+len(" as "):])
 	}
 	fields := strings.Fields(col)
 	if len(fields) > 1 {
+		last := strings.ToLower(fields[len(fields)-1])
+		if last == "desc" || last == "asc" {
+			return strings.TrimSpace(fields[len(fields)-2])
+		}
 		return strings.TrimSpace(fields[len(fields)-1])
 	}
 	return strings.TrimSpace(col)
+}
+
+func contains(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func stripDirection(expr string) string {
+	parts := strings.Fields(expr)
+	if len(parts) > 1 {
+		last := strings.ToLower(parts[len(parts)-1])
+		if last == "desc" || last == "asc" {
+			return strings.Join(parts[:len(parts)-1], " ")
+		}
+	}
+	return expr
 }
 
 func extractSelectColumns(sql string) []string {

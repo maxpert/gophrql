@@ -65,6 +65,7 @@ func isCommentOnly(q string) bool {
 // semanticChecks performs minimal validation needed for current coverage.
 func semanticChecks(q *ast.Query) error {
 	cols := map[string]bool{}
+	joinSeen := false
 
 	for _, step := range q.Steps {
 		switch s := step.(type) {
@@ -92,6 +93,9 @@ func semanticChecks(q *ast.Query) error {
 				}
 				continue
 			}
+			if joinSeen {
+				continue
+			}
 			for _, it := range s.Items {
 				name := sqlgen.ExprName(it.Expr)
 				if it.As != "" {
@@ -104,6 +108,8 @@ func semanticChecks(q *ast.Query) error {
 		case *ast.TakeStep:
 			// already validated in parser; nothing further.
 			_ = s
+		case *ast.JoinStep:
+			joinSeen = true
 		}
 	}
 	return nil
