@@ -4,3 +4,4 @@ coverage*.out
 *.swp
 .DS_Store
 vendor/
+tmp/
