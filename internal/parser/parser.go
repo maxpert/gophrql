@@ -80,6 +80,14 @@ func (p *Parser) parseQuery() (*ast.Query, error) {
 					return nil, err
 				}
 				steps = append(steps, step)
+			case "window":
+				// Skip window block for now (handled downstream).
+				p.next()
+				p.skipNewlines()
+				if p.peekIs(LPAREN) {
+					p.next()
+					p.collectUntilMatching(RPAREN)
+				}
 			case "take":
 				p.next()
 				step, err := p.parseTake()
@@ -208,6 +216,17 @@ func (p *Parser) parseSource() (ast.Source, error) {
 	}
 	if tok.Typ != IDENT {
 		return ast.Source{}, fmt.Errorf("expected source after from, got %v", tok)
+	}
+	if p.peekIs(EQUAL) {
+		alias := tok.Lit
+		p.next()
+		srcTok := p.next()
+		table := srcTok.Lit
+		if srcTok.Typ == IDENT && strings.HasPrefix(srcTok.Lit, "s\"") {
+			inner := strings.Trim(srcTok.Lit, "s\"")
+			table = "SELECT " + strings.TrimPrefix(inner, "SELECT ")
+		}
+		return ast.Source{Table: fmt.Sprintf("%s AS %s", table, alias)}, nil
 	}
 	return ast.Source{Table: tok.Lit}, nil
 }
@@ -588,6 +607,18 @@ func (p *Parser) parseGroupSteps() ([]ast.Step, error) {
 					return nil, err
 				}
 				steps = append(steps, step)
+			case "window":
+				// Skip window blocks within groups for now.
+				p.next()
+				p.skipNewlines()
+				if p.peekIs(IDENT) && strings.Contains(p.peek().Lit, ":") {
+					p.next()
+					p.skipNewlines()
+				}
+				if p.peekIs(LPAREN) {
+					p.next()
+					p.collectUntilMatching(RPAREN)
+				}
 			case "take":
 				p.next()
 				step, err := p.parseTake()
@@ -916,6 +947,15 @@ func (p *Parser) parseJoin() (ast.Step, error) {
 		subQuery = q
 	} else if p.peekIs(IDENT) {
 		table := p.next().Lit
+		if p.peekIs(EQUAL) {
+			alias := table
+			p.next()
+			if !p.peekIs(IDENT) {
+				return nil, fmt.Errorf("join expects table after alias")
+			}
+			tableTok := p.next()
+			table = fmt.Sprintf("%s AS %s", tableTok.Lit, alias)
+		}
 		subQuery = &ast.Query{From: ast.Source{Table: table}}
 	} else {
 		return nil, fmt.Errorf("join expects '(' source")

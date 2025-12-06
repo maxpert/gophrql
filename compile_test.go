@@ -616,6 +616,146 @@ ORDER BY
   table_0.milliseconds DESC
 `,
 		},
+		{
+			name: "group_sort_filter_derive_select_join",
+			prql: `
+s"SELECT album_id,title,artist_id FROM albums"
+group {artist_id} (aggregate { album_title_count = count this.` + "`title`" + `})
+sort {this.artist_id, this.album_title_count}
+filter (this.album_title_count) > 10
+derive {new_album_count = this.album_title_count}
+select {this.artist_id, this.new_album_count}
+join side:left ( s"SELECT artist_id,name as artist_name FROM artists" ) (this.artist_id == that.artist_id)
+`,
+			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    album_id,
+    title,
+    artist_id
+  FROM
+    albums
+),
+table_3 AS (
+  SELECT
+    artist_id,
+    COUNT(*) AS _expr_0
+  FROM
+    table_0
+  GROUP BY
+    artist_id
+),
+table_4 AS (
+  SELECT
+    artist_id,
+    _expr_0 AS new_album_count,
+    _expr_0
+  FROM
+    table_3
+  WHERE
+    _expr_0 > 10
+),
+table_2 AS (
+  SELECT
+    artist_id,
+    new_album_count,
+    _expr_0
+  FROM
+    table_4
+),
+table_1 AS (
+  SELECT
+    artist_id,
+    name as artist_name
+  FROM
+    artists
+)
+SELECT
+  table_2.artist_id,
+  table_2.new_album_count,
+  table_1.artist_id,
+  table_1.artist_name
+FROM
+  table_2
+  LEFT OUTER JOIN table_1 ON table_2.artist_id = table_1.artist_id
+ORDER BY
+  table_2.artist_id,
+  table_2.new_album_count
+`,
+		},
+		{
+			name: "invoice_totals_window_join",
+			prql: `
+from i=invoices
+join ii=invoice_items (==invoice_id)
+derive {
+    city = i.billing_city,
+    street = i.billing_address,
+}
+group {city, street} (
+    derive total = ii.unit_price * ii.quantity
+    aggregate {
+        num_orders = count_distinct i.invoice_id,
+        num_tracks = sum ii.quantity,
+        total_price = sum total,
+    }
+)
+group {city} (
+    sort street
+    window expanding:true (
+        derive {running_total_num_tracks = sum num_tracks}
+    )
+)
+sort {city, street}
+derive {num_tracks_last_week = lag 7 num_tracks}
+select {
+    city,
+    street,
+    num_orders,
+    num_tracks,
+    running_total_num_tracks,
+    num_tracks_last_week
+}
+take 20
+`,
+			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    i.billing_city AS city,
+    i.billing_address AS street,
+    COUNT(DISTINCT i.invoice_id) AS num_orders,
+    COALESCE(SUM(ii.quantity), 0) AS num_tracks
+  FROM
+    invoices AS i
+    INNER JOIN invoice_items AS ii ON i.invoice_id = ii.invoice_id
+  GROUP BY
+    i.billing_city,
+    i.billing_address
+)
+SELECT
+  city,
+  street,
+  num_orders,
+  num_tracks,
+  SUM(num_tracks) OVER (
+    PARTITION BY city
+    ORDER BY
+      street ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS running_total_num_tracks,
+  LAG(num_tracks, 7) OVER (
+    ORDER BY
+      city,
+      street
+  ) AS num_tracks_last_week
+FROM
+  table_0
+ORDER BY
+  city,
+  street
+LIMIT
+  20
+`,
+		},
 	}
 
 	for _, tc := range cases {
