@@ -83,6 +83,14 @@ select { date.to_text invoice_date billing_city }
 `,
 			wantContains: "`date.to_text` only supports a string literal as format",
 		},
+		{
+			name: "date_to_text_unsupported_specifier",
+			prql: `
+from invoices
+select { (invoice_date | date.to_text "%_j") }
+`,
+			wantContains: "PRQL doesn't support this format specifier",
+		},
 	}
 
 	for _, tc := range cases {

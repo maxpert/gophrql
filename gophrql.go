@@ -169,10 +169,8 @@ func checkExprConstraints(expr ast.Expr) error {
 func ensureDateToTextLiteral(expr ast.Expr) error {
 	switch v := expr.(type) {
 	case *ast.Call:
-		if isDateToTextName(sqlgen.ExprName(v.Func)) {
-			if !hasLiteralFormat(v.Args) {
-				return fmt.Errorf("Error: `date.to_text` only supports a string literal as format")
-			}
+		if err := validateDateToTextCall(sqlgen.ExprName(v.Func), v.Args); err != nil {
+			return err
 		}
 		for _, a := range v.Args {
 			if err := ensureDateToTextLiteral(a); err != nil {
@@ -180,6 +178,11 @@ func ensureDateToTextLiteral(expr ast.Expr) error {
 			}
 		}
 	case *ast.Pipe:
+		if id, ok := v.Func.(*ast.Ident); ok {
+			if err := validateDateToTextCall(strings.Join(id.Parts, "."), append([]ast.Expr{v.Input}, v.Args...)); err != nil {
+				return err
+			}
+		}
 		if err := ensureDateToTextLiteral(v.Input); err != nil {
 			return err
 		}
@@ -189,14 +192,6 @@ func ensureDateToTextLiteral(expr ast.Expr) error {
 		for _, a := range v.Args {
 			if err := ensureDateToTextLiteral(a); err != nil {
 				return err
-			}
-		}
-		if id, ok := v.Func.(*ast.Ident); ok && isDateToTextName(strings.Join(id.Parts, ".")) {
-			if len(v.Args) == 0 {
-				return fmt.Errorf("Error: `date.to_text` only supports a string literal as format")
-			}
-			if _, ok := v.Args[len(v.Args)-1].(*ast.StringLit); !ok {
-				return fmt.Errorf("Error: `date.to_text` only supports a string literal as format")
 			}
 		}
 	case *ast.Binary:
@@ -226,4 +221,56 @@ func hasLiteralFormat(args []ast.Expr) bool {
 	}
 	_, ok := args[len(args)-1].(*ast.StringLit)
 	return ok
+}
+
+func validateDateToTextCall(name string, args []ast.Expr) error {
+	if !isDateToTextName(name) {
+		return nil
+	}
+	if len(args) < 2 {
+		return fmt.Errorf("Error: `date.to_text` only supports a string literal as format")
+	}
+	format, ok := args[len(args)-1].(*ast.StringLit)
+	if !ok {
+		return fmt.Errorf("Error: `date.to_text` only supports a string literal as format")
+	}
+	if err := validateDateFormatSpecifiers(format.Value); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateDateFormatSpecifiers(format string) error {
+	allowed := map[string]bool{
+		"Y": true, "y": true, "m": true, "B": true, "b": true, "d": true, "e": true,
+		"H": true, "I": true, "M": true, "S": true, "f": true, "r": true, "R": true,
+		"F": true, "D": true, "+": true, "a": true, "A": true, "%": true, "p": true,
+		"Z": true, "z": true, "V": true, "u": true, "-": true,
+	}
+	for i := 0; i < len(format); i++ {
+		if format[i] != '%' {
+			continue
+		}
+		i++
+		if i >= len(format) {
+			break
+		}
+		if format[i] == '%' {
+			continue
+		}
+		if format[i] == '-' {
+			i++
+			if i >= len(format) {
+				break
+			}
+			if !allowed[string(format[i])] {
+				return fmt.Errorf("Error: PRQL doesn't support this format specifier")
+			}
+			continue
+		}
+		if !allowed[string(format[i])] {
+			return fmt.Errorf("Error: PRQL doesn't support this format specifier")
+		}
+	}
+	return nil
 }
