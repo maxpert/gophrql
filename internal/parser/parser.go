@@ -18,18 +18,49 @@ func Parse(src string) (*ast.Query, error) {
 }
 
 type Parser struct {
-	tokens []Token
-	pos    int
+	tokens     []Token
+	pos        int
+	stopAtPipe bool
 }
 
 func (p *Parser) parseQuery() (*ast.Query, error) {
 	p.skipNewlines()
-	// Skip leading let-declarations (not yet represented in AST).
-	for p.peekIs(IDENT) && p.peek().Lit == "let" {
-		p.skipToLineEnd()
+	var target string
+	var bindings []ast.Binding
+	for {
 		p.skipNewlines()
+		if !p.peekIs(IDENT) {
+			break
+		}
+		switch p.peek().Lit {
+		case "target":
+			p.next()
+			if target != "" {
+				return nil, fmt.Errorf("target already specified")
+			}
+			val, err := p.parseTargetValue()
+			if err != nil {
+				return nil, err
+			}
+			target = val
+			p.skipToLineEnd()
+		case "let":
+			p.next()
+			binding, ok, err := p.parseLetBinding()
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				bindings = append(bindings, binding)
+			}
+			p.skipNewlines()
+		default:
+			goto beginQuery
+		}
 	}
 
+beginQuery:
+	p.skipNewlines()
 	if p.peekIs(IDENT) && p.peek().Lit == "from" {
 		p.next()
 	} else if p.peekIs(IDENT) && (p.peek().Lit == "from_text" || p.peek().Lit == "s") {
@@ -116,6 +147,13 @@ func (p *Parser) parseQuery() (*ast.Query, error) {
 					return nil, err
 				}
 				steps = append(steps, step)
+			case "loop":
+				p.next()
+				step, err := p.parseLoop()
+				if err != nil {
+					return nil, err
+				}
+				steps = append(steps, step)
 			case "join":
 				p.next()
 				step, err := p.parseJoin()
@@ -144,46 +182,109 @@ func (p *Parser) parseQuery() (*ast.Query, error) {
 	}
 
 	return &ast.Query{
-		From:  source,
-		Steps: steps,
+		From:     source,
+		Steps:    steps,
+		Target:   target,
+		Bindings: bindings,
 	}, nil
+}
+
+func (p *Parser) parseTargetValue() (string, error) {
+	p.skipNewlines()
+	if !p.peekIs(IDENT) {
+		return "", fmt.Errorf("expected identifier after target")
+	}
+	var parts []string
+	parts = append(parts, p.next().Lit)
+	for p.peekIs(DOT) {
+		p.next()
+		if !p.peekIs(IDENT) {
+			return "", fmt.Errorf("expected identifier after '.' in target")
+		}
+		parts = append(parts, p.next().Lit)
+	}
+	return strings.ToLower(strings.Join(parts, ".")), nil
+}
+
+func (p *Parser) parseLetBinding() (ast.Binding, bool, error) {
+	p.skipNewlines()
+	if !p.peekIs(IDENT) {
+		return ast.Binding{}, false, fmt.Errorf("expected identifier after let")
+	}
+	name := p.next().Lit
+	if !p.peekIs(EQUAL) {
+		return ast.Binding{}, false, fmt.Errorf("expected '=' in let binding")
+	}
+	p.next()
+	p.skipNewlines()
+	if !p.peekIs(LPAREN) {
+		p.skipLetRemainder()
+		return ast.Binding{}, false, nil
+	}
+	p.next()
+	p.skipNewlines()
+	if !p.peekIs(IDENT) {
+		p.collectUntilMatching(RPAREN)
+		return ast.Binding{}, false, nil
+	}
+	head := p.peek().Lit
+	if head != "from" && head != "from_text" && !strings.HasPrefix(head, "s\"") {
+		p.collectUntilMatching(RPAREN)
+		return ast.Binding{}, false, nil
+	}
+	subTokens := p.collectUntilMatching(RPAREN)
+	subParser := &Parser{tokens: subTokens}
+	subQuery, err := subParser.parseQuery()
+	if err != nil {
+		return ast.Binding{}, false, err
+	}
+	return ast.Binding{Name: name, Query: subQuery}, true, nil
+}
+
+func (p *Parser) skipLetRemainder() {
+	depth := 0
+	for !p.peekIs(EOF) {
+		tok := p.next()
+		switch tok.Typ {
+		case LPAREN, LBRACE, LBRACKET:
+			depth++
+		case RPAREN, RBRACE, RBRACKET:
+			if depth > 0 {
+				depth--
+			}
+		case NEWLINE:
+			if depth == 0 {
+				return
+			}
+		}
+	}
 }
 
 func (p *Parser) parseSource() (ast.Source, error) {
 	p.skipNewlines()
-	if p.peekIs(LBRACKET) {
+	if inline, ok, err := p.parseInlineRowsSource(); ok || err != nil {
+		return inline, err
+	}
+	if p.peekIs(LPAREN) {
 		p.next()
-		var rows []ast.InlineRow
-		for {
-			p.skipNewlines()
-			if p.peekIs(RBRACE) {
-				p.next()
-				continue
-			}
-			if p.peekIs(RBRACKET) {
-				p.next()
-				break
-			}
-			if !p.peekIs(LBRACE) {
-				return ast.Source{}, fmt.Errorf("expected { in inline rows")
-			}
-			p.next()
-			rec, err := p.parseRecord()
-			if err != nil {
-				return ast.Source{}, err
-			}
-			rows = append(rows, rec)
-			p.skipNewlines()
-			if p.peekIs(COMMA) {
-				p.next()
-			}
-			p.skipNewlines()
-			if p.peekIs(RBRACKET) {
-				p.next()
-				break
+		expr, err := p.parseExpr(0)
+		if err != nil {
+			return ast.Source{}, err
+		}
+		if !p.peekIs(RPAREN) {
+			return ast.Source{}, fmt.Errorf("expected ) after inline source")
+		}
+		p.next()
+		if call, ok := expr.(*ast.Call); ok {
+			if name := exprToIdent(call.Func); name == "read_csv" && len(call.Args) == 1 {
+				if lit, ok := call.Args[0].(*ast.StringLit); ok {
+					path := strings.ReplaceAll(lit.Value, "'", "''")
+					table := fmt.Sprintf("SELECT\n    *\n  FROM\n    read_csv('%s')", path)
+					return ast.Source{Table: table}, nil
+				}
 			}
 		}
-		return ast.Source{Rows: rows}, nil
+		return ast.Source{}, fmt.Errorf("unsupported inline source")
 	}
 
 	tok := p.next()
@@ -229,6 +330,112 @@ func (p *Parser) parseSource() (ast.Source, error) {
 		return ast.Source{Table: fmt.Sprintf("%s AS %s", table, alias)}, nil
 	}
 	return ast.Source{Table: tok.Lit}, nil
+}
+
+func (p *Parser) parseInlineRowsSource() (ast.Source, bool, error) {
+	p.skipNewlines()
+	if !p.peekIs(LBRACKET) {
+		return ast.Source{}, false, nil
+	}
+	p.next()
+	var rows []ast.InlineRow
+	for {
+		p.skipNewlines()
+		if p.peekIs(RBRACE) {
+			p.next()
+			continue
+		}
+		if p.peekIs(RBRACKET) {
+			p.next()
+			break
+		}
+		if !p.peekIs(LBRACE) {
+			return ast.Source{}, false, fmt.Errorf("expected { in inline rows")
+		}
+		p.next()
+		rec, err := p.parseRecord()
+		if err != nil {
+			return ast.Source{}, false, err
+		}
+		rows = append(rows, rec)
+		p.skipNewlines()
+		if p.peekIs(COMMA) {
+			p.next()
+		}
+		p.skipNewlines()
+		if p.peekIs(RBRACKET) {
+			p.next()
+			break
+		}
+	}
+	return ast.Source{Rows: rows}, true, nil
+}
+
+func (p *Parser) parseLoop() (ast.Step, error) {
+	p.skipNewlines()
+	hasParens := false
+	if p.peekIs(LPAREN) {
+		hasParens = true
+		p.next()
+	}
+	prev := p.stopAtPipe
+	p.stopAtPipe = true
+	defer func() { p.stopAtPipe = prev }()
+	var steps []ast.Step
+	for {
+		p.skipNewlines()
+		if hasParens {
+			if p.peekIs(RPAREN) {
+				p.next()
+				break
+			}
+			if p.peekIs(EOF) {
+				return nil, fmt.Errorf("unterminated loop body")
+			}
+		} else if p.peekIs(EOF) {
+			break
+		}
+		if !p.peekIs(IDENT) {
+			return nil, fmt.Errorf("unexpected token %v in loop", p.peek())
+		}
+		switch p.peek().Lit {
+		case "filter":
+			p.next()
+			step, err := p.parseFilter()
+			if err != nil {
+				return nil, err
+			}
+			steps = append(steps, step)
+		case "derive":
+			p.next()
+			step, err := p.parseDerive()
+			if err != nil {
+				return nil, err
+			}
+			steps = append(steps, step)
+		case "select":
+			p.next()
+			step, err := p.parseSelect()
+			if err != nil {
+				return nil, err
+			}
+			steps = append(steps, step)
+		case "sort":
+			p.next()
+			step, err := p.parseSort()
+			if err != nil {
+				return nil, err
+			}
+			steps = append(steps, step)
+		default:
+			return nil, fmt.Errorf("unsupported statement %q in loop", p.peek().Lit)
+		}
+		p.skipNewlines()
+		if hasParens && p.peekIs(PIPE) {
+			p.next()
+		}
+	}
+	return &ast.LoopStep{Body: steps}, nil
 }
 
 func (p *Parser) parseFilter() (ast.Step, error) {
@@ -382,7 +589,20 @@ func (p *Parser) parseSelectItem() (ast.SelectItem, error) {
 func (p *Parser) parseAggregate() (ast.Step, error) {
 	p.skipNewlines()
 	if !p.peekIs(LBRACE) {
-		return nil, fmt.Errorf("aggregate expects {")
+		var name string
+		if p.peekIs(IDENT) && p.peekN(1).Typ == EQUAL {
+			name = p.next().Lit
+			p.next()
+		}
+		item, err := p.parseAggregateItem()
+		if err != nil {
+			return nil, err
+		}
+		if name != "" {
+			item.As = name
+		}
+		p.skipToLineEnd()
+		return &ast.AggregateStep{Items: []ast.AggregateItem{item}}, nil
 	}
 	p.next()
 	var items []ast.AggregateItem
@@ -443,7 +663,8 @@ func (p *Parser) parseAggregateItem() (ast.AggregateItem, error) {
 	if len(call.Args) > 0 {
 		arg = call.Args[0]
 	}
-	return ast.AggregateItem{Func: fnName, Arg: arg, As: alias}, nil
+	args := append([]ast.Expr{}, call.Args...)
+	return ast.AggregateItem{Func: fnName, Arg: arg, Args: args, As: alias}, nil
 }
 
 func (p *Parser) parseTake() (ast.Step, error) {
@@ -707,9 +928,11 @@ func (p *Parser) parseSortItem() (ast.SortItem, error) {
 
 // Expression parsing (Pratt-style with limited operators).
 var precedences = map[TokenType]int{
+	OROR:     1,
 	EQ:       2,
 	REGEXEQ:  2,
 	NEQ:      2,
+	NULLCOAL: 2,
 	RANGE:    2,
 	LT:       3,
 	GT:       3,
@@ -737,7 +960,7 @@ func (p *Parser) parseExpr(precedence int) (ast.Expr, error) {
 		}
 
 		// Pipe operator has low precedence; handle directly.
-		if p.peekIs(PIPE) {
+		if p.peekIs(PIPE) && !p.stopAtPipe {
 			if precedence > 1 {
 				break
 			}
@@ -768,7 +991,7 @@ func (p *Parser) parseExpr(precedence int) (ast.Expr, error) {
 		}
 
 		// Function application by adjacency.
-		if p.canStartExpr(p.peek()) {
+		if p.canStartExpr(p.peek()) && p.peek().Typ != MINUS {
 			arg, err := p.parsePrefix()
 			if err != nil {
 				return nil, err
@@ -810,6 +1033,8 @@ func (p *Parser) parsePrefix() (ast.Expr, error) {
 		return &ast.Number{Value: tok.Lit}, nil
 	case STRING:
 		return &ast.StringLit{Value: tok.Lit}, nil
+	case FSTRING:
+		return p.parseFString(tok.Lit)
 	case LPAREN:
 		expr, err := p.parseExpr(0)
 		if err != nil {
@@ -895,6 +1120,9 @@ func (p *Parser) skipNewlines() {
 
 func (p *Parser) skipToLineEnd() {
 	for !p.peekIs(EOF) && !p.peekIs(NEWLINE) {
+		if p.stopAtPipe && (p.peekIs(PIPE) || p.peekIs(RPAREN)) {
+			break
+		}
 		p.next()
 	}
 	p.skipNewlines()
@@ -910,11 +1138,95 @@ func (p *Parser) matchIdent(lit string) bool {
 
 func (p *Parser) canStartExpr(tok Token) bool {
 	switch tok.Typ {
-	case IDENT, NUMBER, STRING, LPAREN, MINUS:
+	case IDENT, NUMBER, STRING, FSTRING, LPAREN, MINUS:
 		return true
 	default:
 		return false
 	}
+}
+
+func (p *Parser) parseFString(lit string) (ast.Expr, error) {
+	var parts []ast.Expr
+	var sb strings.Builder
+	for i := 0; i < len(lit); i++ {
+		ch := lit[i]
+		if ch == '{' {
+			if i+1 < len(lit) && lit[i+1] == '{' {
+				sb.WriteByte('{')
+				i++
+				continue
+			}
+			if sb.Len() > 0 {
+				parts = append(parts, &ast.StringLit{Value: sb.String()})
+				sb.Reset()
+			}
+			i++
+			start := i
+			depth := 1
+			for i < len(lit) && depth > 0 {
+				if lit[i] == '{' {
+					depth++
+				} else if lit[i] == '}' {
+					depth--
+					if depth == 0 {
+						break
+					}
+				}
+				i++
+			}
+			if depth != 0 {
+				return nil, fmt.Errorf("unterminated expression in f-string")
+			}
+			exprStr := strings.TrimSpace(lit[start:i])
+			if exprStr == "" {
+				return nil, fmt.Errorf("empty expression in f-string")
+			}
+			expr, err := parseExprFragment(exprStr)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, expr)
+		} else if ch == '}' {
+			if i+1 < len(lit) && lit[i+1] == '}' {
+				sb.WriteByte('}')
+				i++
+				continue
+			}
+			return nil, fmt.Errorf("single } in f-string")
+		} else {
+			sb.WriteByte(ch)
+		}
+	}
+	if sb.Len() > 0 {
+		parts = append(parts, &ast.StringLit{Value: sb.String()})
+	}
+	if len(parts) == 0 {
+		return &ast.StringLit{Value: ""}, nil
+	}
+	if len(parts) == 1 {
+		return parts[0], nil
+	}
+	return &ast.Call{
+		Func: &ast.Ident{Parts: []string{"__concat__"}},
+		Args: parts,
+	}, nil
+}
+
+func parseExprFragment(src string) (ast.Expr, error) {
+	toks, err := Lex(src)
+	if err != nil {
+		return nil, err
+	}
+	parser := &Parser{tokens: toks}
+	expr, err := parser.parseExpr(0)
+	if err != nil {
+		return nil, err
+	}
+	parser.skipNewlines()
+	if !parser.peekIs(EOF) {
+		return nil, fmt.Errorf("unexpected token %v in f-string", parser.peek())
+	}
+	return expr, nil
 }
 
 func (p *Parser) collectUntilMatching(end TokenType) []Token {
@@ -973,7 +1285,12 @@ func (p *Parser) parseJoin() (ast.Step, error) {
 	}
 	p.skipNewlines()
 	var subQuery *ast.Query
-	if p.peekIs(LPAREN) {
+	if inline, ok, err := p.parseInlineRowsSource(); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		subQuery = &ast.Query{From: inline}
+	} else if p.peekIs(LPAREN) {
 		p.next()
 		subTokens := p.collectUntilMatching(RPAREN)
 		subParser := &Parser{tokens: subTokens}

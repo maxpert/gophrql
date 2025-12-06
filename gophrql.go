@@ -20,17 +20,9 @@ func Compile(prql string) (string, error) {
 		return "", fmt.Errorf("[E0001] Error: No PRQL query entered")
 	}
 
-	if strings.Contains(trimmed, "genre_count") {
-		return sqlgen.CompileGenreCounts(), nil
-	}
-
 	// Allow let bindings before the first from; parser will validate.
 	if !strings.Contains(trimmed, "from") && !strings.Contains(trimmed, "s\"") {
 		return "", fmt.Errorf("[E0001] Error: PRQL queries must begin with 'from'\n↳ Hint: A query must start with a 'from' statement to define the main pipeline")
-	}
-
-	if strings.Contains(trimmed, "addadd") && strings.Contains(trimmed, "addadd 4 5 6") {
-		return "", fmt.Errorf("Error:\n   ╭─[ :5:17 ]\n   │\n 5 │     derive y = (addadd 4 5 6)\n   │                 ──────┬─────\n   │                       ╰─────── Too many arguments to function `addadd`\n───╯")
 	}
 
 	tq, err := parser.Parse(prql)
@@ -43,6 +35,10 @@ func Compile(prql string) (string, error) {
 
 	if err := semanticChecks(tq); err != nil {
 		return "", err
+	}
+
+	if tq.Target != "" && tq.Target != "sql.generic" {
+		return "", fmt.Errorf("unsupported target %q", tq.Target)
 	}
 
 	sql, err := sqlgen.ToSQL(tq)

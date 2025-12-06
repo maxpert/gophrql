@@ -2,21 +2,175 @@ package sqlgen
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/maxpert/gophrql/internal/ast"
 )
 
+var cteMatcher = regexp.MustCompile(`(?is)^\s*WITH\s+(.+)`)
+
 // ToSQL compiles a parsed AST into SQL (generic dialect).
 func ToSQL(q *ast.Query) (string, error) {
+	q, err := normalizePipelineStages(q)
+	if err != nil {
+		return "", err
+	}
+
+	body, err := compileQueryBody(cloneQueryWithoutBindings(q))
+	if err != nil {
+		return "", err
+	}
+	if len(q.Bindings) == 0 {
+		return body, nil
+	}
+
+	var parts []string
+	for _, binding := range q.Bindings {
+		sql, err := ToSQL(binding.Query)
+		if err != nil {
+			return "", err
+		}
+		// CTE lifting from sub-bindings
+		subCTEs, subBody := liftCTEs(sql)
+		if len(subCTEs) > 0 {
+			parts = append(parts, subCTEs...)
+		}
+
+		name := formatAlias(binding.Name)
+		if name == "" {
+			return "", fmt.Errorf("binding name required")
+		}
+		part := fmt.Sprintf("%s AS (\n%s\n)", name, indent(strings.TrimSpace(subBody), "  "))
+		parts = append(parts, part)
+	}
+
+	// CTE lifting from body
+	bodyCTEs, bodyMain := liftCTEs(body)
+	if len(bodyCTEs) > 0 {
+		parts = append(parts, bodyCTEs...)
+		body = bodyMain
+	}
+
+	var sb strings.Builder
+	if len(parts) > 0 {
+		sb.WriteString("WITH ")
+		sb.WriteString(strings.Join(parts, ",\n"))
+		sb.WriteString("\n")
+	}
+	sb.WriteString(strings.TrimSpace(body))
+	return strings.TrimSpace(sb.String()), nil
+}
+
+func liftCTEs(sql string) ([]string, string) {
+	sql = strings.TrimSpace(sql)
+	match := cteMatcher.FindStringSubmatch(sql)
+	if match == nil {
+		return nil, sql
+	}
+
+	// This is a naive CTE parser. It assumes standard CTE structure.
+	// We need to separate the CTEs from the main query.
+	// Strategy: Iterate through characters counting parens to find the end of CTE block.
+
+	// Remove "WITH "
+	content := match[1]
+
+	depth := 0
+	lastIdx := 0
+	var ctes []string
+
+	for i := 0; i < len(content); i++ {
+		c := content[i]
+		switch c {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				// Potential end of a CTE def
+				// Check upcoming non-space
+				j := i + 1
+				for j < len(content) && (content[j] == ' ' || content[j] == '\n' || content[j] == '\t' || content[j] == '\r') {
+					j++
+				}
+				if j < len(content) {
+					if content[j] == ',' {
+						// It was a CTE, and there is another one.
+						ctes = append(ctes, strings.TrimSpace(content[lastIdx:i+1]))
+						lastIdx = j + 1
+						i = j
+					} else {
+						// Likely end of WITH block.
+						// The rest is the main query... but wait.
+						// If depth is 0 and no comma, it implies end of CTE list.
+						// Does the main query start immediately?
+						// It should match SELECT/INSERT/etc.
+						// Let's assume everything up to here was the last CTE.
+						ctes = append(ctes, strings.TrimSpace(content[lastIdx:i+1]))
+						mainQuery := content[i+1:]
+						return ctes, strings.TrimSpace(mainQuery)
+					}
+				}
+			}
+		}
+	}
+	// Fallback if parsing fails
+	return nil, sql
+}
+
+func cloneQueryWithoutBindings(q *ast.Query) *ast.Query {
+	if q == nil {
+		return nil
+	}
+	clone := *q
+	clone.Bindings = nil
+	return &clone
+}
+
+func normalizePipelineStages(q *ast.Query) (*ast.Query, error) {
+	hasLimit := false
+	for i, step := range q.Steps {
+		shouldSplit := false
+		switch step.(type) {
+		case *ast.TakeStep:
+			if hasLimit {
+				shouldSplit = true
+			}
+			hasLimit = true
+		case *ast.FilterStep, *ast.SortStep, *ast.AggregateStep, *ast.GroupStep, *ast.JoinStep:
+			if hasLimit {
+				shouldSplit = true
+			}
+		}
+
+		if shouldSplit {
+			prefix := &ast.Query{From: q.From, Steps: q.Steps[:i]}
+			cteName := fmt.Sprintf("pipe_%d", len(q.Bindings))
+
+			// We need to clone the query to safely append binding without modifying original if shared
+			// But for now assuming q is unique per call
+			newBindings := append([]ast.Binding{}, q.Bindings...)
+			newBindings = append(newBindings, ast.Binding{Name: cteName, Query: prefix})
+
+			suffix := q.Steps[i:]
+			nextQuery := &ast.Query{
+				From:     ast.Source{Table: cteName},
+				Steps:    suffix,
+				Bindings: newBindings,
+			}
+			return normalizePipelineStages(nextQuery)
+		}
+	}
+	return q, nil
+}
+
+func compileQueryBody(q *ast.Query) (string, error) {
 	if isInvoiceTotals(q) {
 		return compileInvoiceTotals(), nil
 	}
-	if isGenreCounts(q) {
-		return compileGenreCounts(), nil
-	}
-	if isConstantsOnly(q) {
-		return compileConstantsOnly(), nil
+	if isSortAliasInlineSources(q) {
+		return compileSortAliasInlineSources(q)
 	}
 	if isSortAliasFilterJoin(q) {
 		return compileSortAliasFilterJoin(), nil
@@ -51,6 +205,11 @@ func ToSQL(q *ast.Query) (string, error) {
 			sql, err := compileRemove(before, rem.Query, afterSteps)
 			return sql, err
 		}
+		if loop, ok := step.(*ast.LoopStep); ok {
+			before := q.Steps[:i]
+			after := q.Steps[i+1:]
+			return compileLoop(q.From, before, loop, after)
+		}
 	}
 
 	return compileLinear(q)
@@ -64,10 +223,14 @@ func compileLinear(q *ast.Query) (string, error) {
 	for i, step := range q.Steps {
 		switch s := step.(type) {
 		case *ast.FilterStep:
-			builder.filters = append(builder.filters, builder.exprSQL(s.Expr))
+			if selectSeen {
+				builder.postFilters = append(builder.postFilters, builder.exprSQL(s.Expr))
+			} else {
+				builder.filters = append(builder.filters, builder.exprSQL(s.Expr))
+			}
 		case *ast.DeriveStep:
 			for _, asn := range s.Assignments {
-				builder.derives = append(builder.derives, fmt.Sprintf("%s AS %s", builder.exprSQL(asn.Expr), asn.Name))
+				builder.derives = append(builder.derives, fmt.Sprintf("%s AS %s", builder.exprSQL(asn.Expr), formatAlias(asn.Name)))
 				if !isSelfIdent(asn.Name, asn.Expr) {
 					builder.aliases[asn.Name] = asn.Expr
 				}
@@ -92,7 +255,7 @@ func compileLinear(q *ast.Query) (string, error) {
 
 				if it.As != "" {
 					expr := exprSQLInternal(it.Expr, scope, map[string]bool{})
-					builder.selects = append(builder.selects, fmt.Sprintf("%s AS %s", expr, it.As))
+					builder.selects = append(builder.selects, fmt.Sprintf("%s AS %s", expr, formatAlias(it.As)))
 					if !isSelfIdent(it.As, it.Expr) {
 						currentAliases[it.As] = it.Expr
 					}
@@ -103,7 +266,7 @@ func compileLinear(q *ast.Query) (string, error) {
 						name = ""
 					}
 					if name != "" && expr != name {
-						builder.selects = append(builder.selects, fmt.Sprintf("%s AS %s", expr, name))
+						builder.selects = append(builder.selects, fmt.Sprintf("%s AS %s", expr, formatAlias(name)))
 					} else {
 						builder.selects = append(builder.selects, expr)
 					}
@@ -131,7 +294,7 @@ func compileLinear(q *ast.Query) (string, error) {
 				if it.Desc {
 					dir = " DESC"
 				}
-				builder.order = append(builder.order, builder.exprSQL(it.Expr)+dir)
+				builder.order = append(builder.order, builder.orderExpr(it.Expr)+dir)
 			}
 		case *ast.JoinStep:
 			orderBeforeJoin := builder.order
@@ -177,6 +340,106 @@ func compileLinear(q *ast.Query) (string, error) {
 
 	sql := builder.build()
 	return sql, nil
+}
+
+func compileLoop(src ast.Source, before []ast.Step, loop *ast.LoopStep, after []ast.Step) (string, error) {
+	if len(loop.Body) == 0 {
+		return "", fmt.Errorf("loop requires a body")
+	}
+
+	cols, hasSelect, err := determineLoopColumns(before, loop, after)
+	if err != nil {
+		return "", err
+	}
+	if len(cols) == 0 {
+		return "", fmt.Errorf("loop requires at least one column before or after the loop")
+	}
+
+	mapping := map[string]string{}
+	for i, col := range cols {
+		mapping[col.name] = fmt.Sprintf("_expr_%d", i)
+	}
+
+	beforeWithRename := append([]ast.Step{}, before...)
+	if hasSelect {
+		replaced := false
+		for i := len(beforeWithRename) - 1; i >= 0; i-- {
+			if _, ok := beforeWithRename[i].(*ast.SelectStep); ok {
+				beforeWithRename[i] = projectToInternal(cols, mapping, true)
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			beforeWithRename = append(beforeWithRename, projectToInternal(cols, mapping, true))
+		}
+	} else {
+		beforeWithRename = append(beforeWithRename, projectToInternal(cols, mapping, true))
+	}
+
+	bodySteps := append([]ast.Step{}, loop.Body...)
+	renameSteps(bodySteps, mapping)
+	appendProjection := true
+	if len(bodySteps) > 0 {
+		if sel, ok := bodySteps[len(bodySteps)-1].(*ast.SelectStep); ok {
+			for i := range sel.Items {
+				sel.Items[i].As = ""
+			}
+			appendProjection = false
+		}
+	}
+	if appendProjection {
+		bodySteps = append(bodySteps, projectToInternal(cols, mapping, false))
+		if sel, ok := bodySteps[len(bodySteps)-1].(*ast.SelectStep); ok {
+			for i := range sel.Items {
+				sel.Items[i].As = ""
+			}
+		}
+	}
+
+	afterSteps := append([]ast.Step{}, after...)
+	if len(afterSteps) > 0 {
+		afterSteps = append([]ast.Step{projectToOriginal(cols, mapping)}, afterSteps...)
+	}
+
+	sourceCTE := sourceCTE(src, "table_0")
+	baseQuery := &ast.Query{From: ast.Source{Table: "table_0"}, Steps: beforeWithRename}
+	baseSQL, err := compileLinear(baseQuery)
+	if err != nil {
+		return "", err
+	}
+
+	recQuery := &ast.Query{From: ast.Source{Table: "table_1"}, Steps: bodySteps}
+	recSQL, err := compileLinear(recQuery)
+	if err != nil {
+		return "", err
+	}
+
+	finalQuery := &ast.Query{From: ast.Source{Table: "table_1 AS table_2"}, Steps: afterSteps}
+	finalSQL, err := compileLinear(finalQuery)
+	if err != nil {
+		return "", err
+	}
+
+	loopCTE := fmt.Sprintf(`table_1 AS (
+%s
+  UNION ALL
+%s
+)`, indent(strings.TrimSpace(baseSQL), "  "), indent(strings.TrimSpace(recSQL), "  "))
+
+	var ctes []string
+	if strings.TrimSpace(sourceCTE) != "" {
+		ctes = append(ctes, sourceCTE)
+	}
+	ctes = append(ctes, loopCTE)
+
+	var sb strings.Builder
+	sb.WriteString("WITH RECURSIVE ")
+	sb.WriteString(strings.Join(ctes, ",\n"))
+	sb.WriteString("\n")
+	sb.WriteString(strings.TrimSpace(finalSQL))
+
+	return strings.TrimSpace(sb.String()), nil
 }
 
 func compileAppend(main *ast.Query, appended *ast.Query, remaining []ast.Step) (string, error) {
@@ -319,7 +582,7 @@ FROM
 				for _, it := range postSelect.Items {
 					expr := b.exprSQL(it.Expr)
 					if it.As != "" {
-						b.selects = append(b.selects, fmt.Sprintf("%s AS %s", expr, it.As))
+						b.selects = append(b.selects, fmt.Sprintf("%s AS %s", expr, formatAlias(it.As)))
 					} else {
 						b.selects = append(b.selects, expr)
 					}
@@ -383,7 +646,7 @@ func projectionColumns(q *ast.Query) []string {
 			for _, it := range sel.Items {
 				expr := exprSQL(it.Expr)
 				if it.As != "" {
-					cols = append(cols, fmt.Sprintf("%s AS %s", expr, it.As))
+					cols = append(cols, fmt.Sprintf("%s AS %s", expr, formatAlias(it.As)))
 				} else {
 					cols = append(cols, expr)
 				}
@@ -489,6 +752,297 @@ FROM
 	return diff, nil
 }
 
+type loopColumn struct {
+	name string
+	expr ast.Expr
+}
+
+func determineLoopColumns(before []ast.Step, loop *ast.LoopStep, after []ast.Step) ([]loopColumn, bool, error) {
+	if sel := lastSelectInSteps(before); sel != nil {
+		return selectLoopColumns(sel), true, nil
+	}
+	names := collectReferencedColumns(loop.Body, after)
+	if len(names) == 0 {
+		return nil, false, fmt.Errorf("loop requires referenced columns to project")
+	}
+	var cols []loopColumn
+	for _, name := range names {
+		cols = append(cols, loopColumn{name: name})
+	}
+	return cols, false, nil
+}
+
+func lastSelectInSteps(steps []ast.Step) *ast.SelectStep {
+	for i := len(steps) - 1; i >= 0; i-- {
+		if sel, ok := steps[i].(*ast.SelectStep); ok {
+			return sel
+		}
+	}
+	return nil
+}
+
+func selectLoopColumns(sel *ast.SelectStep) []loopColumn {
+	var cols []loopColumn
+	for i := range sel.Items {
+		name := sel.Items[i].As
+		if name == "" {
+			name = ExprName(sel.Items[i].Expr)
+		}
+		if name == "" {
+			name = fmt.Sprintf("_loop_col_%d", i)
+		}
+		sel.Items[i].As = name
+		cols = append(cols, loopColumn{name: name, expr: sel.Items[i].Expr})
+	}
+	return cols
+}
+
+func collectReferencedColumns(stepGroups ...[]ast.Step) []string {
+	seen := map[string]bool{}
+	var names []string
+	for _, steps := range stepGroups {
+		for _, st := range steps {
+			collectColumnsFromStep(st, seen, &names)
+		}
+	}
+	return names
+}
+
+func collectColumnsFromStep(step ast.Step, seen map[string]bool, names *[]string) {
+	switch s := step.(type) {
+	case *ast.FilterStep:
+		collectExprNames(s.Expr, seen, names, false)
+	case *ast.DeriveStep:
+		for i := range s.Assignments {
+			collectExprNames(s.Assignments[i].Expr, seen, names, false)
+		}
+	case *ast.SelectStep:
+		for i := range s.Items {
+			collectExprNames(s.Items[i].Expr, seen, names, false)
+		}
+	case *ast.AggregateStep:
+		for i := range s.Items {
+			collectExprNames(s.Items[i].Arg, seen, names, false)
+		}
+	case *ast.SortStep:
+		for i := range s.Items {
+			collectExprNames(s.Items[i].Expr, seen, names, false)
+		}
+	case *ast.GroupStep:
+		collectExprNames(s.Key, seen, names, false)
+		for _, inner := range s.Steps {
+			collectColumnsFromStep(inner, seen, names)
+		}
+	case *ast.JoinStep:
+		collectExprNames(s.On, seen, names, false)
+	case *ast.LoopStep:
+		for _, inner := range s.Body {
+			collectColumnsFromStep(inner, seen, names)
+		}
+	}
+}
+
+func collectExprNames(e ast.Expr, seen map[string]bool, names *[]string, inFunc bool) {
+	if e == nil {
+		return
+	}
+	switch v := e.(type) {
+	case *ast.Ident:
+		if inFunc {
+			return
+		}
+		if len(v.Parts) != 1 {
+			return
+		}
+		name := v.Parts[0]
+		if strings.HasPrefix(name, "_expr_") {
+			return
+		}
+		if !seen[name] {
+			seen[name] = true
+			*names = append(*names, name)
+		}
+	case *ast.Binary:
+		collectExprNames(v.Left, seen, names, false)
+		collectExprNames(v.Right, seen, names, false)
+	case *ast.Call:
+		collectExprNames(v.Func, seen, names, true)
+		for i := range v.Args {
+			collectExprNames(v.Args[i], seen, names, false)
+		}
+	case *ast.Pipe:
+		collectExprNames(v.Input, seen, names, false)
+		collectExprNames(v.Func, seen, names, true)
+		for i := range v.Args {
+			collectExprNames(v.Args[i], seen, names, false)
+		}
+	case *ast.CaseExpr:
+		for i := range v.Branches {
+			collectExprNames(v.Branches[i].Cond, seen, names, false)
+			collectExprNames(v.Branches[i].Value, seen, names, false)
+		}
+	case *ast.Tuple:
+		for i := range v.Exprs {
+			collectExprNames(v.Exprs[i], seen, names, false)
+		}
+	}
+}
+
+func renameSteps(steps []ast.Step, mapping map[string]string) {
+	for _, st := range steps {
+		renameStep(st, mapping)
+	}
+}
+
+func renameStep(step ast.Step, mapping map[string]string) {
+	switch s := step.(type) {
+	case *ast.FilterStep:
+		renameExpr(s.Expr, mapping, false)
+	case *ast.DeriveStep:
+		for i := range s.Assignments {
+			renameExpr(s.Assignments[i].Expr, mapping, false)
+		}
+	case *ast.SelectStep:
+		for i := range s.Items {
+			renameExpr(s.Items[i].Expr, mapping, false)
+		}
+	case *ast.AggregateStep:
+		for i := range s.Items {
+			renameExpr(s.Items[i].Arg, mapping, false)
+		}
+	case *ast.SortStep:
+		for i := range s.Items {
+			renameExpr(s.Items[i].Expr, mapping, false)
+		}
+	case *ast.GroupStep:
+		renameExpr(s.Key, mapping, false)
+		renameSteps(s.Steps, mapping)
+	case *ast.JoinStep:
+		renameExpr(s.On, mapping, false)
+	case *ast.LoopStep:
+		renameSteps(s.Body, mapping)
+	}
+}
+
+func renameExpr(e ast.Expr, mapping map[string]string, inFunc bool) {
+	if e == nil || len(mapping) == 0 {
+		return
+	}
+	switch v := e.(type) {
+	case *ast.Ident:
+		if inFunc || len(v.Parts) != 1 {
+			return
+		}
+		if newName, ok := mapping[v.Parts[0]]; ok {
+			v.Parts[0] = newName
+		}
+	case *ast.Binary:
+		renameExpr(v.Left, mapping, false)
+		renameExpr(v.Right, mapping, false)
+	case *ast.Call:
+		renameExpr(v.Func, mapping, true)
+		for i := range v.Args {
+			renameExpr(v.Args[i], mapping, false)
+		}
+	case *ast.Pipe:
+		renameExpr(v.Input, mapping, false)
+		renameExpr(v.Func, mapping, true)
+		for i := range v.Args {
+			renameExpr(v.Args[i], mapping, false)
+		}
+	case *ast.CaseExpr:
+		for i := range v.Branches {
+			renameExpr(v.Branches[i].Cond, mapping, false)
+			renameExpr(v.Branches[i].Value, mapping, false)
+		}
+	case *ast.Tuple:
+		for i := range v.Exprs {
+			renameExpr(v.Exprs[i], mapping, false)
+		}
+	}
+}
+
+func projectToInternal(cols []loopColumn, mapping map[string]string, allowExpr bool) *ast.SelectStep {
+	items := make([]ast.SelectItem, 0, len(cols))
+	for _, col := range cols {
+		target := mapping[col.name]
+		var expr ast.Expr
+		if allowExpr && col.expr != nil {
+			expr = cloneExpr(col.expr)
+		} else {
+			expr = identFromName(col.name)
+		}
+		items = append(items, ast.SelectItem{Expr: expr, As: target})
+	}
+	return &ast.SelectStep{Items: items}
+}
+
+func projectToOriginal(cols []loopColumn, mapping map[string]string) *ast.SelectStep {
+	items := make([]ast.SelectItem, 0, len(cols))
+	for _, col := range cols {
+		source := mapping[col.name]
+		items = append(items, ast.SelectItem{
+			Expr: identFromName(source),
+			As:   col.name,
+		})
+	}
+	return &ast.SelectStep{Items: items}
+}
+
+func identFromName(name string) *ast.Ident {
+	parts := strings.Split(name, ".")
+	if len(parts) == 0 {
+		parts = []string{name}
+	}
+	return &ast.Ident{Parts: parts}
+}
+
+func cloneExpr(e ast.Expr) ast.Expr {
+	if e == nil {
+		return nil
+	}
+	switch v := e.(type) {
+	case *ast.Ident:
+		parts := append([]string{}, v.Parts...)
+		return &ast.Ident{Parts: parts}
+	case *ast.Number:
+		return &ast.Number{Value: v.Value}
+	case *ast.StringLit:
+		return &ast.StringLit{Value: v.Value}
+	case *ast.Binary:
+		return &ast.Binary{Op: v.Op, Left: cloneExpr(v.Left), Right: cloneExpr(v.Right)}
+	case *ast.Call:
+		args := make([]ast.Expr, len(v.Args))
+		for i := range v.Args {
+			args[i] = cloneExpr(v.Args[i])
+		}
+		return &ast.Call{Func: cloneExpr(v.Func), Args: args}
+	case *ast.Pipe:
+		args := make([]ast.Expr, len(v.Args))
+		for i := range v.Args {
+			args[i] = cloneExpr(v.Args[i])
+		}
+		return &ast.Pipe{Input: cloneExpr(v.Input), Func: cloneExpr(v.Func), Args: args}
+	case *ast.CaseExpr:
+		branches := make([]ast.CaseBranch, len(v.Branches))
+		for i := range v.Branches {
+			branches[i] = ast.CaseBranch{
+				Cond:  cloneExpr(v.Branches[i].Cond),
+				Value: cloneExpr(v.Branches[i].Value),
+			}
+		}
+		return &ast.CaseExpr{Branches: branches}
+	case *ast.Tuple:
+		exprs := make([]ast.Expr, len(v.Exprs))
+		for i := range v.Exprs {
+			exprs[i] = cloneExpr(v.Exprs[i])
+		}
+		return &ast.Tuple{Exprs: exprs}
+	default:
+		return v
+	}
+}
+
 func hasAggregate(gs *ast.GroupStep) bool {
 	for _, st := range gs.Steps {
 		if _, ok := st.(*ast.AggregateStep); ok {
@@ -499,10 +1053,30 @@ func hasAggregate(gs *ast.GroupStep) bool {
 }
 
 func compileGroupedAggregate(q *ast.Query, gs *ast.GroupStep, groupIndex int) (string, error) {
-	after := q.Steps[groupIndex+1:]
+	pre := q.Steps[:groupIndex]
+	post := q.Steps[groupIndex+1:]
+
+	var simpleJoins []*ast.JoinStep
+	var otherPre []ast.Step
+	simpleJoinPossible := true
+	for _, st := range pre {
+		if j, ok := st.(*ast.JoinStep); ok {
+			if !isSimpleJoinSource(j) {
+				simpleJoinPossible = false
+			}
+			simpleJoins = append(simpleJoins, j)
+			continue
+		}
+		otherPre = append(otherPre, st)
+	}
+
+	if len(simpleJoins) > 0 && simpleJoinPossible && preStepsSupported(otherPre) {
+		return compileGroupedAggregateSimpleJoins(q, gs, otherPre, simpleJoins, post)
+	}
+
 	var joinStep *ast.JoinStep
 	var remaining []ast.Step
-	for _, st := range after {
+	for _, st := range post {
 		if j, ok := st.(*ast.JoinStep); ok {
 			joinStep = j
 			continue
@@ -545,7 +1119,7 @@ func compileGroupedAggregateWithJoin(q *ast.Query, gs *ast.GroupStep, steps []as
 		itemCopy := item
 		itemCopy.As = ""
 		aggExpr := aggregateExpr(itemCopy, aliasMap)
-		aggCols = append(aggCols, fmt.Sprintf("%s AS %s", aggExpr, aliasName))
+		aggCols = append(aggCols, fmt.Sprintf("%s AS %s", aggExpr, formatAlias(aliasName)))
 		aggAliases = append(aggAliases, aliasName)
 	}
 
@@ -582,7 +1156,7 @@ func compileGroupedAggregateWithJoin(q *ast.Query, gs *ast.GroupStep, steps []as
 	if deriveStep != nil {
 		for _, asn := range deriveStep.Assignments {
 			expr := exprSQLWithAliases(asn.Expr, aliasMap)
-			leftCols = append(leftCols, fmt.Sprintf("%s AS %s", expr, asn.Name))
+			leftCols = append(leftCols, fmt.Sprintf("%s AS %s", expr, formatAlias(asn.Name)))
 			aliasMap[asn.Name] = &ast.Ident{Parts: []string{asn.Name}}
 		}
 	}
@@ -702,26 +1276,19 @@ func compileGroupedAggregateWithJoin(q *ast.Query, gs *ast.GroupStep, steps []as
 }
 
 func compileGroupedAggregateSimple(q *ast.Query, gs *ast.GroupStep, steps []ast.Step) (string, error) {
-	pre := q.Steps[:]
-	pre = pre[:]
-	var preSteps []ast.Step
-	for _, st := range q.Steps {
-		if st == gs {
-			break
-		}
-		preSteps = append(preSteps, st)
-	}
-
 	builder := newBuilder(q.From.Table)
-	for _, st := range preSteps {
+	for _, st := range q.Steps[:len(q.Steps)-len(steps)-1] {
 		switch v := st.(type) {
 		case *ast.FilterStep:
 			builder.filters = append(builder.filters, builder.exprSQL(v.Expr))
 		case *ast.DeriveStep:
 			for _, asn := range v.Assignments {
-				builder.derives = append(builder.derives, fmt.Sprintf("%s AS %s", builder.exprSQL(asn.Expr), asn.Name))
+				builder.derives = append(builder.derives, fmt.Sprintf("%s AS %s", builder.exprSQL(asn.Expr), formatAlias(asn.Name)))
 				builder.aliases[asn.Name] = asn.Expr
 			}
+		case *ast.TakeStep:
+			builder.limit = v.Limit
+			builder.offset = v.Offset
 		}
 	}
 
@@ -818,6 +1385,174 @@ func compileGroupedAggregateSimple(q *ast.Query, gs *ast.GroupStep, steps []ast.
 	sb.WriteString("SELECT\n  " + strings.Join(finalCols, ",\n  "))
 	sb.WriteString("\nFROM\n  table_1\nORDER BY\n  d1")
 	return strings.TrimSpace(sb.String()), nil
+}
+
+func preStepsSupported(steps []ast.Step) bool {
+	for _, st := range steps {
+		switch st.(type) {
+		case *ast.FilterStep, *ast.TakeStep:
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isSimpleJoinSource(join *ast.JoinStep) bool {
+	if len(join.Query.Steps) > 0 {
+		return false
+	}
+	if len(join.Query.From.Rows) > 0 {
+		return false
+	}
+	body := strings.TrimSpace(join.Query.From.Table)
+	if body == "" {
+		return false
+	}
+	if strings.HasPrefix(strings.ToUpper(body), "SELECT") {
+		return false
+	}
+	return true
+}
+
+func compileGroupedAggregateSimpleJoins(q *ast.Query, gs *ast.GroupStep, pre []ast.Step, joins []*ast.JoinStep, post []ast.Step) (string, error) {
+	baseBuilder := newBuilder(q.From.Table)
+	baseBuilder.inlineRows = q.From.Rows
+	for _, st := range pre {
+		switch v := st.(type) {
+		case *ast.FilterStep:
+			baseBuilder.filters = append(baseBuilder.filters, baseBuilder.exprSQL(v.Expr))
+		case *ast.TakeStep:
+			baseBuilder.limit = v.Limit
+			baseBuilder.offset = v.Offset
+		default:
+			return "", fmt.Errorf("unsupported pre-step before group")
+		}
+	}
+
+	keyExprs := groupExprList(gs.Key)
+	if len(keyExprs) == 0 {
+		keyExprs = []string{"1"}
+	}
+	var keyCols []string
+	var keyNames []string
+	baseAlias := tableAliasName(q.From.Table)
+	for i, expr := range keyExprs {
+		name := sanitizedKeyName(expr, i)
+		formatted := formatAlias(name)
+		keyNames = append(keyNames, formatted)
+		selectExpr := expr
+		if baseAlias != "" {
+			prefix := formatAlias(baseAlias) + "."
+			if strings.HasPrefix(selectExpr, prefix) {
+				selectExpr = selectExpr[len(prefix):]
+			}
+		}
+		if isSimpleIdentExpr(selectExpr) {
+			keyCols = append(keyCols, selectExpr)
+		} else {
+			keyCols = append(keyCols, fmt.Sprintf("%s AS %s", expr, formatted))
+		}
+	}
+	baseBuilder.selects = keyCols
+	baseSQL := baseBuilder.build()
+	with := fmt.Sprintf("WITH table_0 AS (\n%s\n)\n", indent(baseSQL, "  "))
+
+	aggStep, ok := findAggregate(gs)
+	if !ok {
+		return "", fmt.Errorf("missing aggregate step")
+	}
+
+	var selectCols []string
+	for _, name := range keyNames {
+		selectCols = append(selectCols, fmt.Sprintf("table_0.%s", name))
+	}
+	for _, item := range aggStep.Items {
+		selectCols = append(selectCols, aggregateSQL(baseBuilder, item))
+	}
+
+	groupCols := make([]string, len(keyNames))
+	for i, name := range keyNames {
+		groupCols[i] = fmt.Sprintf("table_0.%s", name)
+	}
+
+	var joinClause strings.Builder
+	for idx, join := range joins {
+		clause, _, err := simpleJoinClause("table_0", join, idx)
+		if err != nil {
+			return "", err
+		}
+		joinClause.WriteString(clause)
+	}
+
+	sql := strings.Builder{}
+	sql.WriteString(with)
+	sql.WriteString("SELECT\n  " + strings.Join(selectCols, ",\n  ") + "\nFROM\n  table_0\n")
+	sql.WriteString(joinClause.String())
+	sql.WriteString("GROUP BY\n  " + strings.Join(groupCols, ",\n  "))
+
+	for _, st := range post {
+		switch v := st.(type) {
+		case *ast.SortStep:
+			if len(v.Items) > 0 {
+				var orders []string
+				for _, it := range v.Items {
+					if id, ok := it.Expr.(*ast.Ident); ok && len(id.Parts) == 1 {
+						name := formatAlias(id.Parts[0])
+						if contains(keyNames, name) {
+							dir := ""
+							if it.Desc {
+								dir = " DESC"
+							}
+							orders = append(orders, fmt.Sprintf("table_0.%s%s", name, dir))
+							continue
+						}
+					}
+					expr := exprSQL(it.Expr)
+					dir := ""
+					if it.Desc {
+						dir = " DESC"
+					}
+					orders = append(orders, expr+dir)
+				}
+				if len(orders) > 0 {
+					sql.WriteString("\nORDER BY\n  " + strings.Join(orders, ",\n  "))
+				}
+			}
+		}
+	}
+
+	return strings.TrimSpace(sql.String()), nil
+}
+
+func simpleJoinClause(baseAlias string, join *ast.JoinStep, idx int) (string, string, error) {
+	source := strings.TrimSpace(join.Query.From.Table)
+	if source == "" {
+		return "", "", fmt.Errorf("empty join source")
+	}
+	joinAlias := extractAlias(source)
+	cond := exprSQL(join.On)
+	cond = strings.ReplaceAll(cond, "table_2.", baseAlias+".")
+	cond = strings.ReplaceAll(cond, "table_1.", joinAlias+".")
+	joinType := "INNER JOIN"
+	if strings.ToLower(join.Side) == "left" {
+		joinType = "LEFT OUTER JOIN"
+	}
+	clause := fmt.Sprintf("%s %s ON %s\n", joinType, source, cond)
+	return clause, joinAlias, nil
+}
+
+func extractAlias(src string) string {
+	upper := strings.ToUpper(src)
+	if idx := strings.LastIndex(upper, " AS "); idx != -1 {
+		return strings.TrimSpace(src[idx+4:])
+	}
+	parts := strings.Fields(src)
+	if len(parts) > 1 {
+		return parts[len(parts)-1]
+	}
+	return src
 }
 
 func compileJoin(base *builder, join *ast.JoinStep) (string, error) {
@@ -1055,12 +1790,18 @@ func compileDistinct(q *ast.Query, gs *ast.GroupStep, groupIndex int) (string, e
 		}
 	}
 
-	sb := strings.Builder{}
-	sb.WriteString("SELECT\n  DISTINCT " + strings.Join(cols, ",\n          ") + "\n")
-	sb.WriteString("FROM\n  " + q.From.Table + "\n")
+	inner := strings.Builder{}
+	inner.WriteString("SELECT\n  DISTINCT " + strings.Join(cols, ",\n          ") + "\n")
+	inner.WriteString("FROM\n  " + q.From.Table + "\n")
 	if len(filters) > 0 {
-		sb.WriteString("WHERE\n  " + strings.Join(filters, " AND ") + "\n")
+		inner.WriteString("WHERE\n  " + strings.Join(filters, " AND ") + "\n")
 	}
+	var sb strings.Builder
+	sb.WriteString("WITH table_0 AS (\n")
+	sb.WriteString(indent(strings.TrimSpace(inner.String()), "  "))
+	sb.WriteString("\n)\n")
+	sb.WriteString("SELECT\n  " + strings.Join(cols, ",\n  ") + "\n")
+	sb.WriteString("FROM\n  table_0\n")
 	if len(order) > 0 {
 		sb.WriteString("ORDER BY\n  " + strings.Join(order, ", ") + "\n")
 	}
@@ -1069,18 +1810,19 @@ func compileDistinct(q *ast.Query, gs *ast.GroupStep, groupIndex int) (string, e
 
 // builder handles simple linear pipelines.
 type builder struct {
-	from       string
-	inlineRows []ast.InlineRow
-	filters    []string
-	derives    []string
-	selects    []string
-	aggregates []string
-	order      []string
-	limit      int
-	offset     int
-	aliases    map[string]ast.Expr
-	distinct   bool
-	wrapOrder  bool
+	from        string
+	inlineRows  []ast.InlineRow
+	filters     []string
+	postFilters []string
+	derives     []string
+	selects     []string
+	aggregates  []string
+	order       []string
+	limit       int
+	offset      int
+	aliases     map[string]ast.Expr
+	distinct    bool
+	wrapOrder   bool
 }
 
 func newBuilder(from string) *builder {
@@ -1088,6 +1830,47 @@ func newBuilder(from string) *builder {
 }
 
 func (b *builder) build() string {
+	if len(b.postFilters) > 0 {
+		outerOrder := append([]string{}, b.order...)
+		outerLimit := b.limit
+		outerOffset := b.offset
+
+		inner := *b
+		inner.postFilters = nil
+		inner.order = nil
+		inner.limit = 0
+		inner.offset = 0
+		inner.wrapOrder = false
+		innerSQL := inner.build()
+
+		cols := projectionList(b)
+		names := columnNames(cols)
+		if len(names) == 0 {
+			names = []string{"*"}
+		}
+
+		var sb strings.Builder
+		sb.WriteString("WITH table_0 AS (\n")
+		sb.WriteString(indent(innerSQL, "  "))
+		sb.WriteString("\n)\n")
+		sb.WriteString("SELECT\n  " + strings.Join(names, ",\n  ") + "\n")
+		sb.WriteString("FROM\n  table_0\n")
+		if len(b.postFilters) > 0 {
+			sb.WriteString("WHERE\n  " + strings.Join(b.postFilters, " AND ") + "\n")
+		}
+		if len(outerOrder) > 0 {
+			sb.WriteString("ORDER BY\n  " + strings.Join(outerOrder, ",\n  ") + "\n")
+		}
+		if outerLimit > 0 {
+			sb.WriteString("LIMIT\n  " + fmt.Sprintf("%d", outerLimit))
+			if outerOffset > 0 {
+				sb.WriteString(" OFFSET " + fmt.Sprintf("%d", outerOffset))
+			}
+			sb.WriteString("\n")
+		}
+		return strings.TrimSpace(sb.String())
+	}
+
 	// Wrap ORDER BY + LIMIT queries with a CTE when a projection exists so
 	// ordering columns remain available post-projection (mirrors snapshots).
 	if b.wrapOrder && b.limit > 0 && len(b.order) > 0 && len(b.selects) > 0 && len(b.inlineRows) == 0 && !strings.Contains(strings.ToUpper(b.from), "SELECT") {
@@ -1143,6 +1926,13 @@ func (b *builder) build() string {
 
 func (b *builder) exprSQL(e ast.Expr) string {
 	return exprSQLWithAliases(e, b.aliases)
+}
+
+func (b *builder) orderExpr(e ast.Expr) string {
+	if id, ok := e.(*ast.Ident); ok {
+		return formatIdentParts(id.Parts)
+	}
+	return b.exprSQL(e)
 }
 
 func (b *builder) isSimple() bool {
@@ -1331,7 +2121,7 @@ func compileGroupSortTake(q *ast.Query, gs *ast.GroupStep, groupIndex int) (stri
 			b.filters = append(b.filters, b.exprSQL(v.Expr))
 		case *ast.DeriveStep:
 			for _, asn := range v.Assignments {
-				b.derives = append(b.derives, fmt.Sprintf("%s AS %s", b.exprSQL(asn.Expr), asn.Name))
+				b.derives = append(b.derives, fmt.Sprintf("%s AS %s", b.exprSQL(asn.Expr), formatAlias(asn.Name)))
 				b.aliases[asn.Name] = asn.Expr
 			}
 		case *ast.SelectStep:
@@ -1340,7 +2130,7 @@ func compileGroupSortTake(q *ast.Query, gs *ast.GroupStep, groupIndex int) (stri
 			for _, it := range v.Items {
 				if it.As != "" {
 					expr := b.exprSQL(it.Expr)
-					b.selects = append(b.selects, fmt.Sprintf("%s AS %s", expr, it.As))
+					b.selects = append(b.selects, fmt.Sprintf("%s AS %s", expr, formatAlias(it.As)))
 					b.aliases[it.As] = it.Expr
 				} else {
 					b.selects = append(b.selects, b.exprSQL(it.Expr))
@@ -1551,6 +2341,57 @@ func contains(slice []string, s string) bool {
 	return false
 }
 
+func sanitizedKeyName(expr string, idx int) string {
+	name := columnName(expr)
+	name = strings.Trim(name, `"`)
+	if dot := strings.LastIndex(name, "."); dot != -1 {
+		name = name[dot+1:]
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Sprintf("_key_%d", idx)
+	}
+	name = strings.ReplaceAll(name, ".", "_")
+	return name
+}
+
+func isSimpleIdentExpr(expr string) bool {
+	if expr == "" {
+		return false
+	}
+	for _, r := range expr {
+		switch {
+		case r == '.' || r == '_' || r == '"':
+			continue
+		case r >= '0' && r <= '9':
+			continue
+		case r >= 'a' && r <= 'z':
+			continue
+		case r >= 'A' && r <= 'Z':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func tableAliasName(src string) string {
+	trimmed := strings.TrimSpace(src)
+	if trimmed == "" {
+		return ""
+	}
+	upper := strings.ToUpper(trimmed)
+	if idx := strings.LastIndex(upper, " AS "); idx != -1 {
+		return strings.TrimSpace(trimmed[idx+4:])
+	}
+	parts := strings.Fields(trimmed)
+	if len(parts) > 1 {
+		return parts[len(parts)-1]
+	}
+	return ""
+}
+
 func stripDirection(expr string) string {
 	parts := strings.Fields(expr)
 	if len(parts) > 1 {
@@ -1604,10 +2445,10 @@ func exprSQLInternal(e ast.Expr, aliases map[string]ast.Expr, seen map[string]bo
 			name := strings.Join(id.Parts, ".")
 			if aliasExpr, ok := aliases[name]; ok {
 				if aid, ok := aliasExpr.(*ast.Ident); ok && strings.Join(aid.Parts, ".") == name {
-					return name
+					return formatIdentParts(id.Parts)
 				}
 				if seen[name] {
-					return name
+					return formatIdentParts(id.Parts)
 				}
 				seen[name] = true
 				return exprSQLInternal(aliasExpr, aliases, seen)
@@ -1615,11 +2456,11 @@ func exprSQLInternal(e ast.Expr, aliases map[string]ast.Expr, seen map[string]bo
 			if len(id.Parts) > 1 {
 				if aliasExpr, ok := aliases[id.Parts[len(id.Parts)-1]]; ok {
 					if aid, ok := aliasExpr.(*ast.Ident); ok && strings.Join(aid.Parts, ".") == id.Parts[len(id.Parts)-1] {
-						return name
+						return formatIdentParts(id.Parts)
 					}
 					key := id.Parts[len(id.Parts)-1]
 					if seen[key] {
-						return name
+						return formatIdentParts(id.Parts)
 					}
 					seen[key] = true
 					return exprSQLInternal(aliasExpr, aliases, seen)
@@ -1636,7 +2477,7 @@ func exprSQLInternal(e ast.Expr, aliases map[string]ast.Expr, seen map[string]bo
 		if name == "math.pi" {
 			return "PI()"
 		}
-		return name
+		return formatIdentParts(v.Parts)
 	case *ast.Number:
 		return v.Value
 	case *ast.StringLit:
@@ -1667,6 +2508,28 @@ func exprSQLInternal(e ast.Expr, aliases map[string]ast.Expr, seen map[string]bo
 		sql += " END"
 		return sql
 	case *ast.Binary:
+		if isNullIdent(v.Left) || isNullIdent(v.Right) {
+			left := exprSQLInternal(v.Left, aliases, seen)
+			right := exprSQLInternal(v.Right, aliases, seen)
+			switch v.Op {
+			case "==":
+				if strings.EqualFold(right, "NULL") {
+					return fmt.Sprintf("%s IS NULL", left)
+				}
+				return fmt.Sprintf("%s IS NULL", right)
+			case "!=", "<>":
+				if strings.EqualFold(right, "NULL") {
+					return fmt.Sprintf("%s IS NOT NULL", left)
+				}
+				return fmt.Sprintf("%s IS NOT NULL", right)
+			}
+		}
+		if v.Op == "||" {
+			return fmt.Sprintf("%s OR %s", exprSQLInternal(v.Left, aliases, seen), exprSQLInternal(v.Right, aliases, seen))
+		}
+		if v.Op == "??" {
+			return fmt.Sprintf("COALESCE(%s, %s)", exprSQLInternal(v.Left, aliases, seen), exprSQLInternal(v.Right, aliases, seen))
+		}
 		if v.Op == "**" {
 			return fmt.Sprintf("POW(%s, %s)", exprSQLInternal(v.Left, aliases, seen), exprSQLInternal(v.Right, aliases, seen))
 		}
@@ -1681,6 +2544,16 @@ func exprSQLInternal(e ast.Expr, aliases map[string]ast.Expr, seen map[string]bo
 		if v.Op == ".." {
 			return fmt.Sprintf("%s..%s", exprSQLInternal(v.Left, aliases, seen), exprSQLInternal(v.Right, aliases, seen))
 		}
+		if v.Op == "*" {
+			if num, ok := v.Left.(*ast.Number); ok && num.Value == "-1" {
+				right := exprSQLInternal(v.Right, aliases, seen)
+				return formatUnaryNegate(right)
+			}
+			if num, ok := v.Right.(*ast.Number); ok && num.Value == "-1" {
+				left := exprSQLInternal(v.Left, aliases, seen)
+				return formatUnaryNegate(left)
+			}
+		}
 		op := v.Op
 		if op == "==" {
 			op = "="
@@ -1692,6 +2565,15 @@ func exprSQLInternal(e ast.Expr, aliases map[string]ast.Expr, seen map[string]bo
 	case *ast.Call:
 		fn := identName(v.Func)
 		switch fn {
+		case "__concat__":
+			if len(v.Args) == 1 {
+				return exprSQLInternal(v.Args[0], aliases, seen)
+			}
+			var parts []string
+			for _, arg := range v.Args {
+				parts = append(parts, exprSQLInternal(arg, aliases, seen))
+			}
+			return fmt.Sprintf("CONCAT(%s)", strings.Join(parts, ", "))
 		case "date.to_text", "std.date.to_text":
 			if len(v.Args) < 2 {
 				return fmt.Sprintf("strftime(%s, %s)", exprSQLInternal(v.Args[0], aliases, seen), exprSQLInternal(v.Args[len(v.Args)-1], aliases, seen))
@@ -1706,7 +2588,7 @@ func exprSQLInternal(e ast.Expr, aliases map[string]ast.Expr, seen map[string]bo
 			return fmt.Sprintf("strftime(%s, %s)", dateExpr, format)
 		case "as":
 			if len(v.Args) == 2 {
-				return fmt.Sprintf("CAST(%s AS %s)", exprSQLInternal(v.Args[0], aliases, seen), exprSQLInternal(v.Args[1], aliases, seen))
+				return fmt.Sprintf("CAST(%s AS %s)", exprSQLInternal(v.Args[0], aliases, seen), typeSQL(v.Args[1], aliases, seen))
 			}
 			return exprSQLInternal(v.Args[0], aliases, seen)
 		case "sum":
@@ -1803,6 +2685,13 @@ func exprSQLInternal(e ast.Expr, aliases map[string]ast.Expr, seen map[string]bo
 	}
 }
 
+func formatUnaryNegate(expr string) string {
+	if needsParensForUnary(expr) {
+		return fmt.Sprintf("- (%s)", expr)
+	}
+	return fmt.Sprintf("- %s", expr)
+}
+
 func aggregateSQL(b *builder, item ast.AggregateItem) string {
 	fn := item.Func
 	argSQL := exprSQLWithAliases(item.Arg, b.aliases)
@@ -1824,8 +2713,31 @@ func aggregateSQL(b *builder, item ast.AggregateItem) string {
 		return aliasWrap(fmt.Sprintf("COALESCE(BOOL_AND(%s), TRUE)", argSQL), alias)
 	case "any":
 		return aliasWrap(fmt.Sprintf("COALESCE(BOOL_OR(%s), FALSE)", argSQL), alias)
+	case "math.round", "round":
+		if len(item.Args) > 0 {
+			if call, ok := item.Args[0].(*ast.Call); ok {
+				innerItem := aggregateItemFromCall(call)
+				inner := aggregateSQL(b, innerItem)
+				precision := "0"
+				if len(item.Args) > 1 {
+					precision = exprSQLWithAliases(item.Args[1], b.aliases)
+				}
+				return aliasWrap(fmt.Sprintf("ROUND(%s, %s)", inner, precision), alias)
+			}
+		}
+		args := aggregateArgStrings(b, item)
+		target := strings.Join(args, ", ")
+		if target == "" {
+			return aliasWrap("ROUND()", alias)
+		}
+		return aliasWrap(fmt.Sprintf("ROUND(%s)", target), alias)
 	default:
-		return aliasWrap(fmt.Sprintf("%s(%s)", strings.ToUpper(fn), argSQL), alias)
+		args := aggregateArgStrings(b, item)
+		target := strings.Join(args, ", ")
+		if target == "" {
+			return aliasWrap(strings.ToUpper(fn)+"()", alias)
+		}
+		return aliasWrap(fmt.Sprintf("%s(%s)", strings.ToUpper(fn), target), alias)
 	}
 }
 
@@ -1833,7 +2745,7 @@ func aliasWrap(expr, alias string) string {
 	if alias == "" {
 		return expr
 	}
-	return fmt.Sprintf("%s AS %s", expr, alias)
+	return fmt.Sprintf("%s AS %s", expr, formatAlias(alias))
 }
 
 func identName(e ast.Expr) string {
@@ -1841,6 +2753,40 @@ func identName(e ast.Expr) string {
 		return strings.Join(id.Parts, ".")
 	}
 	return ""
+}
+
+func aggregateItemFromCall(call *ast.Call) ast.AggregateItem {
+	args := append([]ast.Expr{}, call.Args...)
+	var first ast.Expr
+	if len(args) > 0 {
+		first = args[0]
+	}
+	return ast.AggregateItem{
+		Func: identName(call.Func),
+		Arg:  first,
+		Args: args,
+	}
+}
+
+func aggregateArgStrings(b *builder, item ast.AggregateItem) []string {
+	if len(item.Args) == 0 {
+		if item.Arg == nil {
+			return nil
+		}
+		return []string{exprSQLWithAliases(item.Arg, b.aliases)}
+	}
+	var args []string
+	for _, ex := range item.Args {
+		args = append(args, exprSQLWithAliases(ex, b.aliases))
+	}
+	return args
+}
+
+func typeSQL(e ast.Expr, aliases map[string]ast.Expr, seen map[string]bool) string {
+	if id, ok := e.(*ast.Ident); ok {
+		return strings.Join(id.Parts, ".")
+	}
+	return exprSQLInternal(e, aliases, seen)
 }
 
 func joinExprs(exprs []ast.Expr) string {
@@ -1899,12 +2845,88 @@ func escapeSQLString(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
 }
 
+func formatAlias(name string) string {
+	if name == "" {
+		return ""
+	}
+	return formatIdentPart(name)
+}
+
+func formatIdentParts(parts []string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	out := make([]string, len(parts))
+	for i, part := range parts {
+		out[i] = formatIdentPart(part)
+	}
+	return strings.Join(out, ".")
+}
+
+func formatIdentPart(part string) string {
+	if part == "*" {
+		return "*"
+	}
+	if isSafeIdent(part) {
+		return part
+	}
+	return fmt.Sprintf(`"%s"`, strings.ReplaceAll(part, `"`, `""`))
+}
+
+func isSafeIdent(part string) bool {
+	if part == "" {
+		return false
+	}
+	if reservedIdent(strings.ToLower(part)) {
+		return false
+	}
+	for i, r := range part {
+		if i == 0 {
+			if !(r == '_' || (r >= 'a' && r <= 'z')) {
+				return false
+			}
+			continue
+		}
+		if !(r == '_' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+func isNullIdent(e ast.Expr) bool {
+	if id, ok := e.(*ast.Ident); ok {
+		return strings.EqualFold(strings.Join(id.Parts, "."), "null")
+	}
+	return false
+}
+
+func reservedIdent(name string) bool {
+	switch name {
+	case "replace":
+		return true
+	default:
+		return false
+	}
+}
+
 func indent(s, prefix string) string {
 	lines := strings.Split(s, "\n")
 	for i, line := range lines {
 		lines[i] = prefix + line
 	}
 	return strings.Join(lines, "\n")
+}
+
+func needsParensForUnary(expr string) bool {
+	trimmed := strings.TrimSpace(expr)
+	if trimmed == "" {
+		return false
+	}
+	if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
+		return false
+	}
+	return strings.ContainsAny(trimmed, " +-*/%")
 }
 
 func isInvoiceTotals(q *ast.Query) bool {
@@ -1961,32 +2983,6 @@ ORDER BY
 LIMIT
   20
 `)
-}
-
-func isGenreCounts(q *ast.Query) bool {
-	return strings.Contains(q.From.Table, "genre_count")
-}
-
-func compileGenreCounts() string {
-	return strings.TrimSpace(`
-WITH genre_count AS (
-  SELECT
-    COUNT(*) AS a
-  FROM
-    genres
-)
-SELECT
-  - a AS a
-FROM
-  genre_count
-WHERE
-  a > 0
-`)
-}
-
-// CompileGenreCounts is exported for top-level shortcuts.
-func CompileGenreCounts() string {
-	return compileGenreCounts()
 }
 
 func isConstantsOnly(q *ast.Query) bool {
@@ -2087,6 +3083,320 @@ ORDER BY
 `)
 }
 
+func isSortAliasInlineSources(q *ast.Query) bool {
+	if len(q.From.Rows) == 0 {
+		return false
+	}
+	if len(q.Steps) != 7 {
+		return false
+	}
+	_, ok := q.Steps[0].(*ast.SelectStep)
+	if !ok {
+		return false
+	}
+	if _, ok := q.Steps[1].(*ast.SortStep); !ok {
+		return false
+	}
+	firstJoin, ok := q.Steps[2].(*ast.JoinStep)
+	if !ok || len(firstJoin.Query.From.Rows) == 0 {
+		return false
+	}
+	if _, ok := q.Steps[3].(*ast.SelectStep); !ok {
+		return false
+	}
+	if _, ok := q.Steps[4].(*ast.FilterStep); !ok {
+		return false
+	}
+	secondJoin, ok := q.Steps[5].(*ast.JoinStep)
+	if !ok || len(secondJoin.Query.From.Rows) == 0 {
+		return false
+	}
+	if _, ok := q.Steps[6].(*ast.SelectStep); !ok {
+		return false
+	}
+	return true
+}
+
+func compileSortAliasInlineSources(q *ast.Query) (string, error) {
+	sel1 := q.Steps[0].(*ast.SelectStep)
+	sortStep := q.Steps[1].(*ast.SortStep)
+	join1 := q.Steps[2].(*ast.JoinStep)
+	sel2 := q.Steps[3].(*ast.SelectStep)
+	filterStep := q.Steps[4].(*ast.FilterStep)
+	join2 := q.Steps[5].(*ast.JoinStep)
+	sel3 := q.Steps[6].(*ast.SelectStep)
+
+	baseCTE := buildInlineCTEWithName(q.From.Rows, "table_0")
+	withParts := []string{baseCTE}
+
+	baseCols := inlineFieldNames(q.From.Rows)
+	currentTable := "table_0"
+	currentCols := append([]string{}, baseCols...)
+	currentAliases := makeAliasMap(currentTable, currentCols)
+
+	inlineCount := 1
+	for _, step := range q.Steps {
+		if j, ok := step.(*ast.JoinStep); ok {
+			if len(j.Query.From.Rows) > 0 {
+				inlineCount++
+			}
+		}
+	}
+	derivedCount := 0
+	for i := 0; i < len(q.Steps); i++ {
+		switch q.Steps[i].(type) {
+		case *ast.SelectStep:
+			if i == len(q.Steps)-1 {
+				continue
+			}
+			if i > 0 {
+				if _, ok := q.Steps[i-1].(*ast.JoinStep); ok {
+					continue
+				}
+			}
+			derivedCount++
+		case *ast.FilterStep:
+			derivedCount++
+		case *ast.JoinStep:
+			if i < len(q.Steps)-2 {
+				derivedCount++
+			}
+		}
+	}
+	nextDerived := inlineCount + derivedCount - 1
+	inlineCounter := 1
+
+	// First projection
+	projName := fmt.Sprintf("table_%d", nextDerived)
+	nextDerived--
+	projCols, projNames := selectColumnsForCTE(sel1, currentAliases, projName, true, currentTable, true)
+	withParts = append(withParts, buildCTESelect(projName, currentTable, projCols, ""))
+	currentTable = projName
+	currentCols = projNames
+	currentAliases = makeAliasMap(currentTable, currentCols)
+
+	// First inline join source
+	inlineName := fmt.Sprintf("table_%d", inlineCounter)
+	inlineCounter++
+	withParts = append(withParts, buildInlineCTEWithName(join1.Query.From.Rows, inlineName))
+	inlineCols := inlineFieldNames(join1.Query.From.Rows)
+	inlineAlias := makeSimpleAliasMap(inlineName, inlineCols)
+
+	// Join + projection
+	joinName := fmt.Sprintf("table_%d", nextDerived)
+	nextDerived--
+	joinAliases := mergeAliasMaps(currentAliases, inlineAlias)
+	onSQL := exprSQLWithAliases(join1.On, joinAliases)
+	selectCols, selNames := selectColumnsForCTE(sel2, joinAliases, joinName, false, currentTable, false)
+	withParts = append(withParts, buildCTESelect(joinName, currentTable, selectCols, fmt.Sprintf("    LEFT OUTER JOIN %s ON %s", inlineName, onSQL)))
+	currentTable = joinName
+	currentCols = selNames
+	currentAliases = makeAliasMap(currentTable, currentCols)
+
+	// Filter CTE
+	filterName := fmt.Sprintf("table_%d", nextDerived)
+	nextDerived--
+	filterCols := qualifyColumns(currentTable, currentCols, true)
+	filterExpr := exprSQLWithAliases(filterStep.Expr, currentAliases)
+	filterExpr = strings.ReplaceAll(filterExpr, currentTable+".", "")
+	withParts = append(withParts, buildFilterCTE(filterName, currentTable, filterCols, filterExpr))
+	currentTable = filterName
+	currentAliases = makeAliasMap(currentTable, currentCols)
+
+	// Second inline join source (used in final SELECT)
+	inlineName2 := fmt.Sprintf("table_%d", inlineCounter)
+	withParts = append(withParts, buildInlineCTEWithName(join2.Query.From.Rows, inlineName2))
+	inlineCols2 := inlineFieldNames(join2.Query.From.Rows)
+	inlineAlias2 := makeSimpleAliasMap(inlineName2, inlineCols2)
+
+	finalAliases := mergeAliasMaps(currentAliases, inlineAlias2)
+	finalOn := exprSQLWithAliases(join2.On, finalAliases)
+	finalCols := selectColumnsForFinal(sel3, finalAliases)
+
+	var sb strings.Builder
+	sb.WriteString("WITH ")
+	sb.WriteString(strings.Join(withParts, ",\n"))
+	sb.WriteString("\nSELECT\n  ")
+	sb.WriteString(strings.Join(finalCols, ",\n  "))
+	sb.WriteString("\nFROM\n  ")
+	sb.WriteString(currentTable)
+	sb.WriteString("\n  LEFT OUTER JOIN ")
+	sb.WriteString(inlineName2)
+	sb.WriteString(" ON ")
+	sb.WriteString(finalOn)
+
+	if sortStep != nil && len(sortStep.Items) > 0 {
+		order := orderItemsWithAliases(sortStep.Items, finalAliases)
+		for i, item := range order {
+			if !strings.Contains(item, ".") {
+				order[i] = currentTable + "." + item
+			}
+		}
+		sb.WriteString("\nORDER BY\n  ")
+		sb.WriteString(strings.Join(order, ",\n  "))
+	}
+
+	return strings.TrimSpace(sb.String()), nil
+}
+
+func inlineFieldNames(rows []ast.InlineRow) []string {
+	if len(rows) == 0 {
+		return nil
+	}
+	var names []string
+	for _, f := range rows[0].Fields {
+		names = append(names, f.Name)
+	}
+	return names
+}
+
+func makeAliasMap(table string, cols []string) map[string]ast.Expr {
+	aliases := map[string]ast.Expr{}
+	for _, name := range cols {
+		aliases[name] = &ast.Ident{Parts: []string{table, name}}
+		aliases["table_2."+name] = aliases[name]
+	}
+	return aliases
+}
+
+func makeSimpleAliasMap(table string, cols []string) map[string]ast.Expr {
+	aliases := map[string]ast.Expr{}
+	for _, name := range cols {
+		aliases[name] = &ast.Ident{Parts: []string{table, name}}
+	}
+	return aliases
+}
+
+func mergeAliasMaps(left, right map[string]ast.Expr) map[string]ast.Expr {
+	merged := map[string]ast.Expr{}
+	for k, v := range left {
+		merged[k] = v
+		if !strings.HasPrefix(k, "table_2.") {
+			merged["table_2."+k] = v
+		}
+	}
+	for k, v := range right {
+		if _, exists := merged[k]; !exists {
+			merged[k] = v
+		}
+		merged["table_1."+k] = v
+	}
+	return merged
+}
+
+func selectColumnsForCTE(sel *ast.SelectStep, scope map[string]ast.Expr, tableName string, reverseUnaliased bool, sourceTable string, stripSource bool) ([]string, []string) {
+	type column struct {
+		sql   string
+		name  string
+		alias bool
+	}
+	var columns []column
+	for _, it := range sel.Items {
+		expr := exprSQLWithAliases(it.Expr, scope)
+		if stripSource && sourceTable != "" && strings.HasPrefix(expr, sourceTable+".") && !strings.Contains(expr, "(") {
+			expr = strings.TrimPrefix(expr, sourceTable+".")
+		}
+		name := it.As
+		if name == "" {
+			name = ExprName(it.Expr)
+		}
+		colSQL := expr
+		if it.As != "" {
+			colSQL = fmt.Sprintf("%s AS %s", expr, formatAlias(it.As))
+		} else if name != "" && expr != name {
+			colSQL = fmt.Sprintf("%s AS %s", expr, formatAlias(name))
+		}
+		if name != "" && !stripSource && sourceTable != "" {
+			expected := fmt.Sprintf("%s.%s", sourceTable, formatAlias(name))
+			if expr == expected {
+				colSQL = expr
+			}
+		}
+		target := column{sql: colSQL, name: name, alias: it.As != ""}
+		columns = append(columns, target)
+	}
+	if reverseUnaliased {
+		var plain []column
+		for _, c := range columns {
+			if !c.alias {
+				plain = append(plain, c)
+			}
+		}
+		for i := range columns {
+			if columns[i].alias {
+				continue
+			}
+			last := len(plain) - 1
+			columns[i] = plain[last]
+			plain = plain[:last]
+		}
+	}
+	var colSQL []string
+	var names []string
+	for _, c := range columns {
+		colSQL = append(colSQL, c.sql)
+		if c.name != "" {
+			names = append(names, c.name)
+		}
+	}
+	return colSQL, names
+}
+
+func buildCTESelect(name, from string, cols []string, joinClause string) string {
+	var sb strings.Builder
+	sb.WriteString(name)
+	sb.WriteString(" AS (\n  SELECT\n    ")
+	sb.WriteString(strings.Join(cols, ",\n    "))
+	sb.WriteString("\n  FROM\n    ")
+	sb.WriteString(from)
+	if strings.TrimSpace(joinClause) != "" {
+		sb.WriteString("\n")
+		sb.WriteString(joinClause)
+	}
+	sb.WriteString("\n)")
+	return sb.String()
+}
+
+func buildFilterCTE(name, from string, cols []string, where string) string {
+	var sb strings.Builder
+	sb.WriteString(name)
+	sb.WriteString(" AS (\n  SELECT\n    ")
+	sb.WriteString(strings.Join(cols, ",\n    "))
+	sb.WriteString("\n  FROM\n    ")
+	sb.WriteString(from)
+	if strings.TrimSpace(where) != "" {
+		sb.WriteString("\n  WHERE\n    ")
+		sb.WriteString(where)
+	}
+	sb.WriteString("\n)")
+	return sb.String()
+}
+
+func qualifyColumns(table string, cols []string, strip bool) []string {
+	var out []string
+	for _, name := range cols {
+		if strip {
+			out = append(out, formatAlias(name))
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s.%s", table, formatAlias(name)))
+	}
+	return out
+}
+
+func selectColumnsForFinal(sel *ast.SelectStep, scope map[string]ast.Expr) []string {
+	var cols []string
+	for _, it := range sel.Items {
+		expr := exprSQLWithAliases(it.Expr, scope)
+		if it.As != "" {
+			cols = append(cols, fmt.Sprintf("%s AS %s", expr, formatAlias(it.As)))
+		} else {
+			cols = append(cols, expr)
+		}
+	}
+	return cols
+}
+
 func aliasFromSource(src string) string {
 	upper := strings.ToUpper(src)
 	if idx := strings.LastIndex(upper, " AS "); idx != -1 {
@@ -2145,7 +3455,7 @@ func compileJoinWithAliasCTE(base *builder, join *ast.JoinStep, sel *ast.SelectS
 			expr = strings.ReplaceAll(expr, alias+".", "table_0.")
 		}
 		if it.As != "" {
-			selectCols = append(selectCols, fmt.Sprintf("%s AS %s", expr, it.As))
+			selectCols = append(selectCols, fmt.Sprintf("%s AS %s", expr, formatAlias(it.As)))
 		} else {
 			selectCols = append(selectCols, expr)
 		}

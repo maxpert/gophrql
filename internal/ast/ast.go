@@ -2,9 +2,10 @@ package ast
 
 // Query represents a PRQL pipeline starting with a source.
 type Query struct {
-	From   Source
-	Steps  []Step
-	Target string // optional target (e.g., sql.generic)
+	From     Source
+	Steps    []Step
+	Target   string // optional target (e.g., sql.generic)
+	Bindings []Binding
 }
 
 // Source represents a relation source.
@@ -20,6 +21,12 @@ type InlineRow struct {
 type Field struct {
 	Name string
 	Expr Expr
+}
+
+// Binding represents a named sub-query defined via `let`.
+type Binding struct {
+	Name  string
+	Query *Query
 }
 
 // Step is a pipeline stage.
@@ -51,6 +58,7 @@ type (
 	AggregateItem struct {
 		Func string
 		Arg  Expr
+		Args []Expr
 		As   string
 	}
 	TakeStep struct {
@@ -62,6 +70,9 @@ type (
 	}
 	RemoveStep struct {
 		Query *Query
+	}
+	LoopStep struct {
+		Body []Step
 	}
 	JoinStep struct {
 		Side  string
@@ -89,6 +100,7 @@ func (*AggregateStep) isStep() {}
 func (*TakeStep) isStep()      {}
 func (*AppendStep) isStep()    {}
 func (*RemoveStep) isStep()    {}
+func (*LoopStep) isStep()      {}
 func (*JoinStep) isStep()      {}
 func (*GroupStep) isStep()     {}
 func (*SortStep) isStep()      {}

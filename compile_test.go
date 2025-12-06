@@ -14,6 +14,22 @@ func TestCompileSnapshots(t *testing.T) {
 		wantSQL string
 	}{
 		{
+			name: "target_sql_generic_simple",
+			prql: `
+target sql.generic
+from invoices
+take 1
+`,
+			wantSQL: `
+SELECT
+  *
+FROM
+  invoices
+LIMIT
+  1
+`,
+		},
+		{
 			name: "aggregation",
 			prql: `
 from tracks
@@ -74,6 +90,77 @@ LIMIT
 `,
 		},
 		{
+			name: "switch_case_display",
+			prql: `
+from tracks
+sort milliseconds
+select display = case [
+    composer != null => composer,
+    genre_id < 17 => 'no composer',
+    true => f'unknown composer'
+]
+take 10
+`,
+			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    CASE
+      WHEN composer IS NOT NULL THEN composer
+      WHEN genre_id < 17 THEN 'no composer'
+      ELSE 'unknown composer'
+    END AS display,
+    milliseconds
+  FROM
+    tracks
+  ORDER BY
+    milliseconds
+  LIMIT
+    10
+)
+SELECT
+  display
+FROM
+  table_0
+ORDER BY
+  milliseconds
+`,
+		},
+		{
+			name: "loop_recursive_numbers",
+			prql: `
+from [{n = 1}]
+select n = n - 2
+loop (filter n < 4 | select n = n + 1)
+select n = n * 2
+sort n
+`,
+			wantSQL: `
+WITH RECURSIVE table_0 AS (
+  SELECT
+    1 AS n
+),
+table_1 AS (
+  SELECT
+    n - 2 AS _expr_0
+  FROM
+    table_0
+  UNION ALL
+  SELECT
+    _expr_0 + 1
+  FROM
+    table_1
+  WHERE
+    _expr_0 < 4
+)
+SELECT
+  _expr_0 * 2 AS n
+FROM
+  table_1 AS table_2
+ORDER BY
+  n
+`,
+		},
+		{
 			name: "genre_counts",
 			prql: `
 let genre_count = (
@@ -98,6 +185,30 @@ FROM
   genre_count
 WHERE
   a > 0
+`,
+		},
+		{
+			name: "let_binding_simple_cte",
+			prql: `
+let top_customers = (
+    from invoices
+    aggregate { total = count invoice_id }
+)
+
+from top_customers
+select total
+`,
+			wantSQL: `
+WITH top_customers AS (
+  SELECT
+    COUNT(*) AS total
+  FROM
+    invoices
+)
+SELECT
+  total
+FROM
+  top_customers
 `,
 		},
 		{
@@ -339,18 +450,19 @@ filter true
 select d = 10
 `,
 			wantSQL: `
-WITH table_1 AS (
+WITH pipe_0 AS (
   SELECT
-    NULL
+    *
   FROM
     genres
   LIMIT
     10
-), table_0 AS (
+),
+pipe_1 AS (
   SELECT
-    NULL
+    *
   FROM
-    table_1
+    pipe_0
   WHERE
     true
   LIMIT
@@ -359,7 +471,7 @@ WITH table_1 AS (
 SELECT
   10 AS d
 FROM
-  table_0
+  pipe_1
 WHERE
   true
 `,
@@ -404,6 +516,41 @@ FROM
     LIMIT
       6 OFFSET 39
   ) AS table_3
+`,
+		},
+		{
+			name: "append_select_simple",
+			prql: `
+from invoices
+select { invoice_id, billing_country }
+append (
+  from invoices
+  select { invoice_id = invoice_id + 100, billing_country }
+)
+filter (billing_country | text.starts_with "I")
+`,
+			wantSQL: `
+WITH table_1 AS (
+  SELECT
+    invoice_id,
+    billing_country
+  FROM
+    invoices
+  UNION
+  ALL
+  SELECT
+    invoice_id + 100 AS invoice_id,
+    billing_country
+  FROM
+    invoices
+)
+SELECT
+  invoice_id,
+  billing_country
+FROM
+  table_1
+WHERE
+  billing_country LIKE CONCAT('I', '%')
 `,
 		},
 		{
@@ -633,38 +780,59 @@ FROM
 `,
 		},
 		{
-			name: "stdlib_text_module",
+			name: "text_module_filters",
 			prql: `
-from employees
+from albums
 select {
-  name_lower = (name | text.lower),
-  name_upper = (name | text.upper),
-  name_ltrim = (name | text.ltrim),
-  name_rtrim = (name | text.rtrim),
-  name_trim = (name | text.trim),
-  name_length = (name | text.length),
-  name_extract = (name | text.extract 3 5),
-  name_replace = (name | text.replace "pika" "chu"),
-  name_starts_with = (name | text.starts_with "pika"),
-  name_contains = (name | text.contains "pika"),
-  name_ends_with = (name | text.ends_with "pika"),
+    title,
+    title_and_spaces = f"  {title}  ",
+    low = (title | text.lower),
+    up = (title | text.upper),
+    ltrimmed = (title | text.ltrim),
+    rtrimmed = (title | text.rtrim),
+    trimmed = (title | text.trim),
+    len = (title | text.length),
+    subs = (title | text.extract 2 5),
+    replace = (title | text.replace "al" "PIKA"),
 }
+sort {title}
+filter (title | text.starts_with "Black") || (title | text.contains "Sabbath") || (title | text.ends_with "os")
 `,
 			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    title,
+    CONCAT('  ', title, '  ') AS title_and_spaces,
+    LOWER(title) AS low,
+    UPPER(title) AS up,
+    LTRIM(title) AS ltrimmed,
+    RTRIM(title) AS rtrimmed,
+    TRIM(title) AS trimmed,
+    CHAR_LENGTH(title) AS len,
+    SUBSTRING(title, 2, 5) AS subs,
+    REPLACE(title, 'al', 'PIKA') AS "replace"
+  FROM
+    albums
+)
 SELECT
-  LOWER(name) AS name_lower,
-  UPPER(name) AS name_upper,
-  LTRIM(name) AS name_ltrim,
-  RTRIM(name) AS name_rtrim,
-  TRIM(name) AS name_trim,
-  CHAR_LENGTH(name) AS name_length,
-  SUBSTRING(name, 3, 5) AS name_extract,
-  REPLACE(name, 'pika', 'chu') AS name_replace,
-  name LIKE CONCAT('pika', '%') AS name_starts_with,
-  name LIKE CONCAT('%', 'pika', '%') AS name_contains,
-  name LIKE CONCAT('%', 'pika') AS name_ends_with
+  title,
+  title_and_spaces,
+  low,
+  up,
+  ltrimmed,
+  rtrimmed,
+  trimmed,
+  len,
+  subs,
+  "replace"
 FROM
-  employees
+  table_0
+WHERE
+  title LIKE CONCAT('Black', '%')
+  OR title LIKE CONCAT('%', 'Sabbath', '%')
+  OR title LIKE CONCAT('%', 'os')
+ORDER BY
+  title
 `,
 		},
 		{
@@ -712,13 +880,21 @@ group tracks.* (take 1)
 sort tracks.*
 `,
 			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    DISTINCT album_id,
+    genre_id
+  FROM
+    tracks
+)
 SELECT
-  DISTINCT album_id,
-          genre_id
+  album_id,
+  genre_id
 FROM
-  tracks
+  table_0
 ORDER BY
-  album_id, genre_id
+  album_id,
+  genre_id
 `,
 		},
 		{
@@ -1198,6 +1374,204 @@ ORDER BY
   street
 LIMIT
   20
+`,
+		},
+		{
+			name: "group_all_join_aggregate",
+			prql: `
+from a=albums
+take 10
+join tracks (==album_id)
+group {a.album_id, a.title} (
+  aggregate price = (sum tracks.unit_price | math.round 2)
+)
+sort album_id
+`,
+			wantSQL: `
+WITH pipe_0 AS (
+  SELECT
+    *
+  FROM
+    albums AS a
+  LIMIT
+    10
+),
+table_0 AS (
+  SELECT
+    a.album_id,
+    a.title
+  FROM
+    pipe_0
+)
+SELECT
+  table_0.album_id,
+  table_0.title,
+  ROUND(COALESCE(SUM(tracks.unit_price), 0), 2) AS price
+FROM
+  table_0
+  INNER JOIN tracks ON table_0.album_id = tracks.album_id
+GROUP BY
+  table_0.album_id,
+  table_0.title
+ORDER BY
+  table_0.album_id
+`,
+		},
+		{
+			name: "read_csv_sort",
+			prql: `
+from (read_csv "data_file_root/media_types.csv")
+sort media_type_id
+`,
+			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    *
+  FROM
+    read_csv('data_file_root/media_types.csv')
+)
+SELECT
+  *
+FROM
+  table_0
+ORDER BY
+  media_type_id
+`,
+		},
+		{
+			name: "sort_preserved_through_join",
+			prql: `
+from e=employees
+filter first_name != "Mitchell"
+sort {first_name, last_name}
+join manager=employees side:left (e.reports_to == manager.employee_id)
+select {e.first_name, e.last_name, manager.first_name}
+`,
+			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    first_name,
+    last_name,
+    reports_to
+  FROM
+    employees AS e
+  WHERE
+    first_name <> 'Mitchell'
+)
+SELECT
+  table_0.first_name,
+  table_0.last_name,
+  manager.first_name
+FROM
+  table_0
+  LEFT OUTER JOIN employees AS manager ON table_0.reports_to = manager.employee_id
+ORDER BY
+  table_0.first_name,
+  table_0.last_name
+`,
+		},
+		{
+			name: "sort_alias_join",
+			prql: `
+from albums
+select { AA=album_id, artist_id }
+sort AA
+filter AA >= 25
+join artists (==artist_id)
+`,
+			wantSQL: `
+WITH table_1 AS (
+  SELECT
+    album_id AS "AA",
+    artist_id
+  FROM
+    albums
+),
+table_0 AS (
+  SELECT
+    "AA",
+    artist_id
+  FROM
+    table_1
+  WHERE
+    "AA" >= 25
+)
+SELECT
+  table_0."AA",
+  table_0.artist_id,
+  artists.*
+FROM
+  table_0
+  INNER JOIN artists ON table_0.artist_id = artists.artist_id
+ORDER BY
+  table_0."AA"
+`,
+		},
+		{
+			name: "sort_alias_inline_sources",
+			prql: `
+from [{track_id=0, album_id=1, genre_id=2}]
+select { AA=track_id, album_id, genre_id }
+sort AA
+join side:left [{album_id=1, album_title="Songs"}] (==album_id)
+select { AA, AT = album_title ?? "unknown", genre_id }
+filter AA < 25
+join side:left [{genre_id=1, genre_title="Rock"}] (==genre_id)
+select { AA, AT, GT = genre_title ?? "unknown" }
+`,
+			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    0 AS track_id,
+    1 AS album_id,
+    2 AS genre_id
+),
+table_5 AS (
+  SELECT
+    track_id AS "AA",
+    genre_id,
+    album_id
+  FROM
+    table_0
+),
+table_1 AS (
+  SELECT
+    1 AS album_id,
+    'Songs' AS album_title
+),
+table_4 AS (
+  SELECT
+    table_5."AA",
+    COALESCE(table_1.album_title, 'unknown') AS "AT",
+    table_5.genre_id
+  FROM
+    table_5
+    LEFT OUTER JOIN table_1 ON table_5.album_id = table_1.album_id
+),
+table_3 AS (
+  SELECT
+    "AA",
+    "AT",
+    genre_id
+  FROM
+    table_4
+  WHERE
+    "AA" < 25
+),
+table_2 AS (
+  SELECT
+    1 AS genre_id,
+    'Rock' AS genre_title
+)
+SELECT
+  table_3."AA",
+  table_3."AT",
+  COALESCE(table_2.genre_title, 'unknown') AS "GT"
+FROM
+  table_3
+  LEFT OUTER JOIN table_2 ON table_3.genre_id = table_2.genre_id
+ORDER BY
+  table_3."AA"
 `,
 		},
 	}

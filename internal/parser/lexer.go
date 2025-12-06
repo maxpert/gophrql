@@ -14,6 +14,7 @@ const (
 	IDENT             = "IDENT"
 	NUMBER            = "NUMBER"
 	STRING            = "STRING"
+	FSTRING           = "FSTRING"
 	NEWLINE           = "NEWLINE"
 
 	LPAREN   = "("
@@ -36,6 +37,8 @@ const (
 	POW      = "**"
 	REGEXEQ  = "~="
 	RANGE    = ".."
+	NULLCOAL = "??"
+	OROR     = "||"
 	ARROW    = "=>"
 	EQ       = "=="
 	NEQ      = "!="
@@ -76,6 +79,35 @@ func Lex(input string) ([]Token, error) {
 			for i < len(input) && input[i] != '\n' {
 				i++
 			}
+			continue
+		}
+
+		// f-strings: f'...' or f"..."
+		if (ch == 'f' || ch == 'F') && i+1 < len(input) && (input[i+1] == '\'' || input[i+1] == '"') {
+			quote := input[i+1]
+			allowEscape := quote == '"'
+			i += 2
+			var sb strings.Builder
+			for i < len(input) {
+				if input[i] == quote {
+					break
+				}
+				if allowEscape && input[i] == '\\' && i+1 < len(input) {
+					next := input[i+1]
+					if next == quote || next == '\\' {
+						sb.WriteByte(next)
+						i += 2
+						continue
+					}
+				}
+				sb.WriteByte(input[i])
+				i++
+			}
+			if i >= len(input) {
+				return nil, fmt.Errorf("unterminated string literal")
+			}
+			i++
+			tokens = append(tokens, Token{Typ: FSTRING, Lit: sb.String()})
 			continue
 		}
 
@@ -187,6 +219,16 @@ func Lex(input string) ([]Token, error) {
 		}
 		if strings.HasPrefix(input[i:], "~=") {
 			tokens = append(tokens, Token{Typ: REGEXEQ, Lit: "~="})
+			i += 2
+			continue
+		}
+		if strings.HasPrefix(input[i:], "??") {
+			tokens = append(tokens, Token{Typ: NULLCOAL, Lit: "??"})
+			i += 2
+			continue
+		}
+		if strings.HasPrefix(input[i:], "||") {
+			tokens = append(tokens, Token{Typ: OROR, Lit: "||"})
 			i += 2
 			continue
 		}

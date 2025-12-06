@@ -14,6 +14,15 @@ func TestCompileErrors(t *testing.T) {
 		wantContains string
 	}{
 		{
+			name: "unsupported_target",
+			prql: `
+target sql.duckdb
+from tracks
+take 1
+`,
+			wantContains: "unsupported target",
+		},
+		{
 			name:         "comment_only",
 			prql:         `# just a comment`,
 			wantContains: "No PRQL query entered",
