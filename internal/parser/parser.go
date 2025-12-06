@@ -965,6 +965,10 @@ func (p *Parser) parseJoin() (ast.Step, error) {
 		return nil, fmt.Errorf("join expects '(' source")
 	}
 	p.skipNewlines()
+	if p.peekIs(IDENT) && strings.Contains(p.peek().Lit, "side:") {
+		side = strings.SplitN(p.next().Lit, ":", 2)[1]
+	}
+	p.skipNewlines()
 	if !p.peekIs(LPAREN) {
 		return nil, fmt.Errorf("join expects '(' condition")
 	}

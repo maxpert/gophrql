@@ -54,6 +54,7 @@ func compileLinear(q *ast.Query) (string, error) {
 	builder := newBuilder(q.From.Table)
 	builder.inlineRows = q.From.Rows
 	selectSeen := false
+	var pendingSort *ast.SortStep
 	for i, step := range q.Steps {
 		switch s := step.(type) {
 		case *ast.FilterStep:
@@ -80,6 +81,9 @@ func compileLinear(q *ast.Query) (string, error) {
 				}
 			}
 			selectSeen = true
+			if builder.limit > 0 && len(builder.order) > 0 {
+				builder.wrapOrder = true
+			}
 		case *ast.TakeStep:
 			builder.limit = s.Limit
 			builder.offset = s.Offset
@@ -87,6 +91,7 @@ func compileLinear(q *ast.Query) (string, error) {
 				builder.wrapOrder = true
 			}
 		case *ast.SortStep:
+			pendingSort = s
 			for _, it := range s.Items {
 				dir := ""
 				if it.Desc {
@@ -95,11 +100,37 @@ func compileLinear(q *ast.Query) (string, error) {
 				builder.order = append(builder.order, builder.exprSQL(it.Expr)+dir)
 			}
 		case *ast.JoinStep:
+			orderBeforeJoin := builder.order
+			builder.order = nil
+			rest := append([]ast.Step{}, q.Steps[i+1:]...)
+
+			alias := aliasFromSource(builder.from)
+			var restSelect *ast.SelectStep
+			var restSort *ast.SortStep
+			for _, st := range rest {
+				if ss, ok := st.(*ast.SelectStep); ok {
+					restSelect = ss
+				}
+				if so, ok := st.(*ast.SortStep); ok {
+					restSort = so
+				}
+			}
+			if alias != "" && restSelect != nil {
+				sortToUse := restSort
+				if sortToUse == nil && pendingSort != nil {
+					sortToUse = pendingSort
+				}
+				return compileJoinWithAliasCTE(builder, s, restSelect, sortToUse)
+			}
+
 			joinSQL, err := compileJoin(builder, s)
 			if err != nil {
 				return "", err
 			}
-			next := &ast.Query{From: ast.Source{Table: "(" + joinSQL + ")"}, Steps: q.Steps[i+1:]}
+			if len(orderBeforeJoin) > 0 && (len(rest) == 0 || !hasSort(rest)) && pendingSort != nil {
+				rest = append([]ast.Step{pendingSort}, rest...)
+			}
+			next := &ast.Query{From: ast.Source{Table: "(" + joinSQL + ")"}, Steps: rest}
 			return compileLinear(next)
 		case *ast.RemoveStep:
 			return compileRemove(&ast.Query{From: q.From, Steps: q.Steps[:0]}, s.Query, q.Steps)
@@ -573,7 +604,9 @@ func compileJoin(base *builder, join *ast.JoinStep) (string, error) {
 	if leftSimple {
 		leftClause = base.from
 	} else {
-		leftSQL := indent(base.build(), "    ")
+		leftCopy := *base
+		leftCopy.order = nil
+		leftSQL := indent(leftCopy.build(), "    ")
 		leftClause = fmt.Sprintf("(\n%s\n  ) AS table_left", leftSQL)
 		leftAlias = "table_left"
 	}
@@ -735,6 +768,15 @@ func hasSortTake(gs *ast.GroupStep) bool {
 func hasGroupDerive(gs *ast.GroupStep) bool {
 	for _, st := range gs.Steps {
 		if _, ok := st.(*ast.DeriveStep); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSort(steps []ast.Step) bool {
+	for _, st := range steps {
+		if _, ok := st.(*ast.SortStep); ok {
 			return true
 		}
 	}
@@ -1648,4 +1690,146 @@ WHERE
 // CompileGenreCounts is exported for top-level shortcuts.
 func CompileGenreCounts() string {
 	return compileGenreCounts()
+}
+
+func aliasFromSource(src string) string {
+	upper := strings.ToUpper(src)
+	if idx := strings.LastIndex(upper, " AS "); idx != -1 {
+		return strings.TrimSpace(src[idx+4:])
+	}
+	return ""
+}
+
+func compileJoinWithAliasCTE(base *builder, join *ast.JoinStep, sel *ast.SelectStep, sort *ast.SortStep) (string, error) {
+	alias := aliasFromSource(base.from)
+	if alias == "" {
+		return "", fmt.Errorf("alias required for CTE join")
+	}
+
+	seen := map[string]bool{}
+	var cols []string
+	addCol := func(c string) {
+		if !seen[c] {
+			seen[c] = true
+			cols = append(cols, c)
+		}
+	}
+	for _, it := range sel.Items {
+		collectAliasFieldsOrdered(it.Expr, alias, addCol)
+	}
+	collectAliasFieldsOrdered(join.On, alias, addCol)
+	if len(cols) == 0 {
+		addCol("*")
+	}
+
+	with := strings.Builder{}
+	with.WriteString("WITH table_0 AS (\n  SELECT\n    ")
+	with.WriteString(strings.Join(cols, ",\n    "))
+	with.WriteString("\n  FROM\n    ")
+	with.WriteString(base.from)
+	if len(base.filters) > 0 {
+		with.WriteString("\n  WHERE\n    " + strings.Join(base.filters, " AND "))
+	}
+	with.WriteString("\n)\n")
+
+	right := join.Query.From.Table
+	joinType := "LEFT OUTER JOIN"
+	if strings.ToLower(join.Side) == "inner" {
+		joinType = "INNER JOIN"
+	}
+
+	cond := exprSQL(join.On)
+	if alias != "" {
+		cond = strings.ReplaceAll(cond, alias+".", "table_0.")
+	}
+
+	var selectCols []string
+	for _, it := range sel.Items {
+		expr := exprSQL(it.Expr)
+		if alias != "" {
+			expr = strings.ReplaceAll(expr, alias+".", "table_0.")
+		}
+		if it.As != "" {
+			selectCols = append(selectCols, fmt.Sprintf("%s AS %s", expr, it.As))
+		} else {
+			selectCols = append(selectCols, expr)
+		}
+	}
+
+	sql := with.String()
+	sql += "SELECT\n  " + strings.Join(selectCols, ",\n  ") + "\nFROM\n  table_0\n  " + joinType + " " + right + " ON " + cond
+
+	if sort != nil && len(sort.Items) > 0 {
+		var order []string
+		for _, it := range sort.Items {
+			expr := exprSQL(it.Expr)
+			if alias != "" {
+				expr = strings.ReplaceAll(expr, alias+".", "table_0.")
+			}
+			if !strings.Contains(expr, ".") {
+				expr = "table_0." + expr
+			}
+			if it.Desc {
+				expr += " DESC"
+			}
+			order = append(order, expr)
+		}
+		sql += "\nORDER BY\n  " + strings.Join(order, ",\n  ")
+	}
+
+	return sql, nil
+}
+
+func collectAliasFields(e ast.Expr, alias string, dst map[string]bool) {
+	switch v := e.(type) {
+	case *ast.Ident:
+		if len(v.Parts) >= 2 && v.Parts[0] == alias {
+			dst[v.Parts[1]] = true
+		}
+	case *ast.Binary:
+		collectAliasFields(v.Left, alias, dst)
+		collectAliasFields(v.Right, alias, dst)
+	case *ast.Call:
+		collectAliasFields(v.Func, alias, dst)
+		for _, a := range v.Args {
+			collectAliasFields(a, alias, dst)
+		}
+	case *ast.Pipe:
+		collectAliasFields(v.Input, alias, dst)
+		collectAliasFields(v.Func, alias, dst)
+		for _, a := range v.Args {
+			collectAliasFields(a, alias, dst)
+		}
+	case *ast.Tuple:
+		for _, ex := range v.Exprs {
+			collectAliasFields(ex, alias, dst)
+		}
+	}
+}
+
+func collectAliasFieldsOrdered(e ast.Expr, alias string, add func(string)) {
+	switch v := e.(type) {
+	case *ast.Ident:
+		if len(v.Parts) >= 2 && v.Parts[0] == alias {
+			add(v.Parts[1])
+		}
+	case *ast.Binary:
+		collectAliasFieldsOrdered(v.Left, alias, add)
+		collectAliasFieldsOrdered(v.Right, alias, add)
+	case *ast.Call:
+		collectAliasFieldsOrdered(v.Func, alias, add)
+		for _, a := range v.Args {
+			collectAliasFieldsOrdered(a, alias, add)
+		}
+	case *ast.Pipe:
+		collectAliasFieldsOrdered(v.Input, alias, add)
+		collectAliasFieldsOrdered(v.Func, alias, add)
+		for _, a := range v.Args {
+			collectAliasFieldsOrdered(a, alias, add)
+		}
+	case *ast.Tuple:
+		for _, ex := range v.Exprs {
+			collectAliasFieldsOrdered(ex, alias, add)
+		}
+	}
 }

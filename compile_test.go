@@ -106,6 +106,58 @@ ORDER BY
 `,
 		},
 		{
+			name: "take_range_with_sort",
+			prql: `
+from tracks
+sort {+track_id}
+take 3..5
+`,
+			wantSQL: `
+SELECT
+  *
+FROM
+  tracks
+ORDER BY
+  track_id
+LIMIT
+  3 OFFSET 2
+`,
+		},
+		{
+			name: "sort_with_join_alias",
+			prql: `
+from e=employees
+filter first_name != "Mitchell"
+sort {first_name, last_name}
+
+join manager=employees side:left (e.reports_to == manager.employee_id)
+
+select {e.first_name, e.last_name, manager.first_name}
+`,
+			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    first_name,
+    last_name,
+    reports_to
+  FROM
+    employees AS e
+  WHERE
+    first_name <> 'Mitchell'
+)
+SELECT
+  table_0.first_name,
+  table_0.last_name,
+  manager.first_name
+FROM
+  table_0
+  LEFT OUTER JOIN employees AS manager ON table_0.reports_to = manager.employee_id
+ORDER BY
+  table_0.first_name,
+  table_0.last_name
+`,
+		},
+		{
 			name: "append_select_union",
 			prql: `
 from invoices
@@ -318,17 +370,28 @@ take 1..15
 select {name, composer}
 `,
 			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    name,
+    composer,
+    track_id
+  FROM
+    tracks
+  WHERE
+    REGEXP(name, 'Love')
+    AND milliseconds / 1000 / 60 BETWEEN 3 AND 4
+  ORDER BY
+    track_id
+  LIMIT
+    15
+)
 SELECT
   name,
   composer
 FROM
-  tracks
-WHERE
-  REGEXP(name, 'Love') AND milliseconds / 1000 / 60 BETWEEN 3 AND 4
+  table_0
 ORDER BY
   track_id
-LIMIT
-  15
 `,
 		},
 		{
