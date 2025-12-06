@@ -133,19 +133,30 @@ func Lex(input string) ([]Token, error) {
 			continue
 		}
 
-		// Double-quoted strings.
+		// Double-quoted strings with simple escape handling for \" and \\.
 		if ch == '"' {
-			start := i + 1
 			i++
-			for i < len(input) && input[i] != '"' {
+			var sb strings.Builder
+			for i < len(input) {
+				if input[i] == '"' {
+					break
+				}
+				if input[i] == '\\' && i+1 < len(input) {
+					next := input[i+1]
+					if next == '"' || next == '\\' {
+						sb.WriteByte(next)
+						i += 2
+						continue
+					}
+				}
+				sb.WriteByte(input[i])
 				i++
 			}
 			if i >= len(input) {
 				return nil, fmt.Errorf("unterminated string literal")
 			}
-			lit := input[start:i]
 			i++
-			tokens = append(tokens, Token{Typ: STRING, Lit: lit})
+			tokens = append(tokens, Token{Typ: STRING, Lit: sb.String()})
 			continue
 		}
 

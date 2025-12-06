@@ -91,6 +91,11 @@ func semanticChecks(q *ast.Query) error {
 				}
 			}
 		case *ast.SelectStep:
+			for _, it := range s.Items {
+				if err := checkExprConstraints(it.Expr); err != nil {
+					return err
+				}
+			}
 			// If nothing known yet, accept first select and record aliases.
 			if len(cols) == 0 {
 				for _, it := range s.Items {
@@ -111,9 +116,6 @@ func semanticChecks(q *ast.Query) error {
 				continue
 			}
 			for _, it := range s.Items {
-				if err := checkExprConstraints(it.Expr); err != nil {
-					return err
-				}
 				name := sqlgen.ExprName(it.Expr)
 				if it.As != "" {
 					name = it.As
@@ -161,46 +163,67 @@ func hasAddAddOverflow(expr ast.Expr) bool {
 }
 
 func checkExprConstraints(expr ast.Expr) error {
-	if containsDateToText(expr) {
-		return fmt.Errorf("Error: Date formatting requires a dialect")
+	return ensureDateToTextLiteral(expr)
+}
+
+func ensureDateToTextLiteral(expr ast.Expr) error {
+	switch v := expr.(type) {
+	case *ast.Call:
+		if isDateToTextName(sqlgen.ExprName(v.Func)) {
+			if !hasLiteralFormat(v.Args) {
+				return fmt.Errorf("Error: `date.to_text` only supports a string literal as format")
+			}
+		}
+		for _, a := range v.Args {
+			if err := ensureDateToTextLiteral(a); err != nil {
+				return err
+			}
+		}
+	case *ast.Pipe:
+		if err := ensureDateToTextLiteral(v.Input); err != nil {
+			return err
+		}
+		if err := ensureDateToTextLiteral(v.Func); err != nil {
+			return err
+		}
+		for _, a := range v.Args {
+			if err := ensureDateToTextLiteral(a); err != nil {
+				return err
+			}
+		}
+		if id, ok := v.Func.(*ast.Ident); ok && isDateToTextName(strings.Join(id.Parts, ".")) {
+			if len(v.Args) == 0 {
+				return fmt.Errorf("Error: `date.to_text` only supports a string literal as format")
+			}
+			if _, ok := v.Args[len(v.Args)-1].(*ast.StringLit); !ok {
+				return fmt.Errorf("Error: `date.to_text` only supports a string literal as format")
+			}
+		}
+	case *ast.Binary:
+		if err := ensureDateToTextLiteral(v.Left); err != nil {
+			return err
+		}
+		if err := ensureDateToTextLiteral(v.Right); err != nil {
+			return err
+		}
+	case *ast.Tuple:
+		for _, ex := range v.Exprs {
+			if err := ensureDateToTextLiteral(ex); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
 
-func containsDateToText(expr ast.Expr) bool {
-	switch v := expr.(type) {
-	case *ast.Ident:
-		name := strings.Join(v.Parts, ".")
-		if name == "date.to_text" || name == "std.date.to_text" {
-			return true
-		}
-	case *ast.Call:
-		name := sqlgen.ExprName(v.Func)
-		if name == "date.to_text" || name == "std.date.to_text" {
-			return true
-		}
-		for _, a := range v.Args {
-			if containsDateToText(a) {
-				return true
-			}
-		}
-	case *ast.Pipe:
-		if containsDateToText(v.Func) || containsDateToText(v.Input) {
-			return true
-		}
-		for _, a := range v.Args {
-			if containsDateToText(a) {
-				return true
-			}
-		}
-	case *ast.Binary:
-		return containsDateToText(v.Left) || containsDateToText(v.Right)
-	case *ast.Tuple:
-		for _, ex := range v.Exprs {
-			if containsDateToText(ex) {
-				return true
-			}
-		}
+func isDateToTextName(name string) bool {
+	return name == "date.to_text" || name == "std.date.to_text"
+}
+
+func hasLiteralFormat(args []ast.Expr) bool {
+	if len(args) == 0 {
+		return false
 	}
-	return false
+	_, ok := args[len(args)-1].(*ast.StringLit)
+	return ok
 }

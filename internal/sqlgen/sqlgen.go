@@ -1640,7 +1640,7 @@ func exprSQLInternal(e ast.Expr, aliases map[string]ast.Expr, seen map[string]bo
 	case *ast.Number:
 		return v.Value
 	case *ast.StringLit:
-		return fmt.Sprintf("'%s'", v.Value)
+		return fmt.Sprintf("'%s'", escapeSQLString(v.Value))
 	case *ast.Tuple:
 		var parts []string
 		for _, ex := range v.Exprs {
@@ -1692,6 +1692,18 @@ func exprSQLInternal(e ast.Expr, aliases map[string]ast.Expr, seen map[string]bo
 	case *ast.Call:
 		fn := identName(v.Func)
 		switch fn {
+		case "date.to_text", "std.date.to_text":
+			if len(v.Args) < 2 {
+				return fmt.Sprintf("strftime(%s, %s)", exprSQLInternal(v.Args[0], aliases, seen), exprSQLInternal(v.Args[len(v.Args)-1], aliases, seen))
+			}
+			dateExpr := exprSQLInternal(v.Args[0], aliases, seen)
+			var format string
+			if lit, ok := v.Args[len(v.Args)-1].(*ast.StringLit); ok {
+				format = fmt.Sprintf("'%s'", escapeSQLString(lit.Value))
+			} else {
+				format = exprSQLInternal(v.Args[len(v.Args)-1], aliases, seen)
+			}
+			return fmt.Sprintf("strftime(%s, %s)", dateExpr, format)
 		case "as":
 			if len(v.Args) == 2 {
 				return fmt.Sprintf("CAST(%s AS %s)", exprSQLInternal(v.Args[0], aliases, seen), exprSQLInternal(v.Args[1], aliases, seen))
@@ -1881,6 +1893,10 @@ func isSelfIdent(name string, e ast.Expr) bool {
 func isNumberExpr(e ast.Expr) bool {
 	_, ok := e.(*ast.Number)
 	return ok
+}
+
+func escapeSQLString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
 }
 
 func indent(s, prefix string) string {

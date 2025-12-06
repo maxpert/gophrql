@@ -34,6 +34,46 @@ WHERE
 `,
 		},
 		{
+			name: "date_to_text_formats",
+			prql: `
+from invoices
+take 20
+select {
+  d1 = (invoice_date | date.to_text "%Y/%m/%d"),
+  d2 = (invoice_date | date.to_text "%F"),
+  d3 = (invoice_date | date.to_text "%D"),
+  d4 = (invoice_date | date.to_text "%H:%M:%S.%f"),
+  d5 = (invoice_date | date.to_text "%r"),
+  d6 = (invoice_date | date.to_text "%A %B %-d %Y"),
+  d7 = (invoice_date | date.to_text "%a, %-d %b %Y at %I:%M:%S %p"),
+  d8 = (invoice_date | date.to_text "%+"),
+  d9 = (invoice_date | date.to_text "%-d/%-m/%y"),
+  d10 = (invoice_date | date.to_text "%-Hh %Mmin"),
+  d11 = (invoice_date | date.to_text "%M'%S\""),
+  d12 = (invoice_date | date.to_text "100%% in %d days"),
+}
+`,
+			wantSQL: `
+SELECT
+  strftime(invoice_date, '%Y/%m/%d') AS d1,
+  strftime(invoice_date, '%F') AS d2,
+  strftime(invoice_date, '%D') AS d3,
+  strftime(invoice_date, '%H:%M:%S.%f') AS d4,
+  strftime(invoice_date, '%r') AS d5,
+  strftime(invoice_date, '%A %B %-d %Y') AS d6,
+  strftime(invoice_date, '%a, %-d %b %Y at %I:%M:%S %p') AS d7,
+  strftime(invoice_date, '%+') AS d8,
+  strftime(invoice_date, '%-d/%-m/%y') AS d9,
+  strftime(invoice_date, '%-Hh %Mmin') AS d10,
+  strftime(invoice_date, '%M''%S"') AS d11,
+  strftime(invoice_date, '100%% in %d days') AS d12
+FROM
+  invoices
+LIMIT
+  20
+`,
+		},
+		{
 			name: "genre_counts",
 			prql: `
 let genre_count = (

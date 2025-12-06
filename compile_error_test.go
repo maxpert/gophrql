@@ -76,12 +76,12 @@ take 1.8
 			wantContains: "No PRQL query entered",
 		},
 		{
-			name: "date_to_text_requires_dialect",
+			name: "date_to_text_literal_format",
 			prql: `
 from invoices
-derive { d_str = (invoice_date | date.to_text "%Y/%m/%d") }
+select { date.to_text invoice_date billing_city }
 `,
-			wantContains: "Date formatting requires a dialect",
+			wantContains: "`date.to_text` only supports a string literal as format",
 		},
 	}
 
