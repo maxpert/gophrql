@@ -356,6 +356,13 @@ func (p *Parser) parseGroup() (ast.Step, error) {
 		return nil, fmt.Errorf("group expects identifier key")
 	}
 	keyTok := p.next()
+	if strings.HasSuffix(keyTok.Lit, ".") && p.peekIs(STAR) {
+		keyTok.Lit = strings.TrimSuffix(keyTok.Lit, ".")
+		p.next()
+	} else if p.peekIs(DOT) && p.peekN(1).Typ == STAR {
+		p.next()
+		p.next()
+	}
 	keyExpr := &ast.Ident{Parts: strings.Split(keyTok.Lit, ".")}
 	p.skipNewlines()
 	if !p.peekIs(LPAREN) {
@@ -485,17 +492,20 @@ func (p *Parser) parseSortItem() (ast.SortItem, error) {
 
 // Expression parsing (Pratt-style with limited operators).
 var precedences = map[TokenType]int{
-	EQ:    2,
-	NEQ:   2,
-	LT:    3,
-	GT:    3,
-	LTE:   3,
-	GTE:   3,
-	PLUS:  4,
-	MINUS: 4,
-	STAR:  5,
-	SLASH: 5,
-	POW:   6,
+	EQ:      2,
+	REGEXEQ: 2,
+	NEQ:     2,
+	RANGE:   2,
+	LT:      3,
+	GT:      3,
+	LTE:     3,
+	GTE:     3,
+	PLUS:    4,
+	MINUS:   4,
+	STAR:    5,
+	SLASH:   5,
+	PERCENT: 5,
+	POW:     6,
 }
 
 func (p *Parser) parseExpr(precedence int) (ast.Expr, error) {
@@ -524,6 +534,15 @@ func (p *Parser) parseExpr(precedence int) (ast.Expr, error) {
 					return nil, err
 				}
 				args = append(args, arg)
+			}
+			if p.peekIs(RANGE) && len(args) > 0 {
+				start := args[len(args)-1]
+				p.next()
+				right, err := p.parseExpr(precedences[RANGE] + 1)
+				if err != nil {
+					return nil, err
+				}
+				args[len(args)-1] = &ast.Binary{Op: "..", Left: start, Right: right}
 			}
 			left = &ast.Pipe{Input: left, Func: fn, Args: args}
 			continue
@@ -559,6 +578,11 @@ func (p *Parser) parsePrefix() (ast.Expr, error) {
 	tok := p.next()
 	switch tok.Typ {
 	case IDENT:
+		if p.peekIs(DOT) && p.peekN(1).Typ == STAR {
+			p.next()
+			p.next()
+			return &ast.Ident{Parts: []string{tok.Lit, "*"}}, nil
+		}
 		return &ast.Ident{Parts: strings.Split(tok.Lit, ".")}, nil
 	case NUMBER:
 		return &ast.Number{Value: tok.Lit}, nil

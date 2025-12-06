@@ -10,8 +10,11 @@ import (
 // ToSQL compiles a parsed AST into SQL (generic dialect).
 func ToSQL(q *ast.Query) (string, error) {
 	// Special-case: group handling from tests.
-	for _, step := range q.Steps {
+	for i, step := range q.Steps {
 		if gs, ok := step.(*ast.GroupStep); ok {
+			if isDistinctGroup(gs) {
+				return compileDistinct(q, gs, i)
+			}
 			return compileGrouped(q, gs)
 		}
 	}
@@ -214,6 +217,76 @@ ORDER BY
 	return final, nil
 }
 
+func isDistinctGroup(gs *ast.GroupStep) bool {
+	if len(gs.Steps) == 1 {
+		if _, ok := gs.Steps[0].(*ast.TakeStep); ok {
+			if id, ok := gs.Key.(*ast.Ident); ok && (len(id.Parts) == 1 || (len(id.Parts) == 2 && id.Parts[1] == "*")) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func compileDistinct(q *ast.Query, gs *ast.GroupStep, groupIndex int) (string, error) {
+	var selectStep *ast.SelectStep
+	for _, st := range q.Steps[:groupIndex] {
+		if s, ok := st.(*ast.SelectStep); ok {
+			selectStep = s
+			break
+		}
+	}
+
+	var cols []string
+	if selectStep != nil {
+		for _, it := range selectStep.Items {
+			if it.As != "" {
+				cols = append(cols, it.As)
+			} else {
+				cols = append(cols, exprSQL(it.Expr))
+			}
+		}
+	}
+	if len(cols) == 0 {
+		cols = []string{"*"}
+	}
+
+	var filters []string
+	for _, st := range q.Steps[:groupIndex] {
+		if f, ok := st.(*ast.FilterStep); ok {
+			filters = append(filters, exprSQL(f.Expr))
+		}
+	}
+
+	var order []string
+	for _, st := range q.Steps[groupIndex+1:] {
+		if s, ok := st.(*ast.SortStep); ok {
+			for _, it := range s.Items {
+				if id, ok := it.Expr.(*ast.Ident); ok && len(id.Parts) == 2 && id.Parts[1] == "*" {
+					order = append(order, strings.Join(cols, ", "))
+					continue
+				}
+				dir := ""
+				if it.Desc {
+					dir = " DESC"
+				}
+				order = append(order, exprSQL(it.Expr)+dir)
+			}
+		}
+	}
+
+	sb := strings.Builder{}
+	sb.WriteString("SELECT\n  DISTINCT " + strings.Join(cols, ",\n          ") + "\n")
+	sb.WriteString("FROM\n  " + q.From.Table + "\n")
+	if len(filters) > 0 {
+		sb.WriteString("WHERE\n  " + strings.Join(filters, " AND ") + "\n")
+	}
+	if len(order) > 0 {
+		sb.WriteString("ORDER BY\n  " + strings.Join(order, ", ") + "\n")
+	}
+	return strings.TrimSpace(sb.String()), nil
+}
+
 // builder handles simple linear pipelines.
 type builder struct {
 	from       string
@@ -293,7 +366,13 @@ func exprSQLWithAliases(e ast.Expr, aliases map[string]ast.Expr) string {
 		return fmt.Sprintf("'%s'", v.Value)
 	case *ast.Binary:
 		if v.Op == "**" {
-			return fmt.Sprintf("POW(%s, %s)", exprSQL(v.Left), exprSQL(v.Right))
+			return fmt.Sprintf("POW(%s, %s)", exprSQLWithAliases(v.Left, aliases), exprSQLWithAliases(v.Right, aliases))
+		}
+		if v.Op == "~=" {
+			return fmt.Sprintf("REGEXP(%s, %s)", exprSQLWithAliases(v.Left, aliases), exprSQLWithAliases(v.Right, aliases))
+		}
+		if v.Op == ".." {
+			return fmt.Sprintf("%s..%s", exprSQLWithAliases(v.Left, aliases), exprSQLWithAliases(v.Right, aliases))
 		}
 		op := v.Op
 		if op == "==" {
@@ -372,6 +451,13 @@ func exprSQLWithAliases(e ast.Expr, aliases map[string]ast.Expr) string {
 			return fmt.Sprintf("%s LIKE CONCAT('%%', %s, '%%')", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(v.Args[1], aliases))
 		case "text.ends_with":
 			return fmt.Sprintf("%s LIKE CONCAT('%%', %s)", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(v.Args[1], aliases))
+		case "in":
+			if len(v.Args) == 2 {
+				if rng, ok := v.Args[1].(*ast.Binary); ok && rng.Op == ".." {
+					return fmt.Sprintf("%s BETWEEN %s AND %s", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(rng.Left, aliases), exprSQLWithAliases(rng.Right, aliases))
+				}
+			}
+			return fmt.Sprintf("%s IN (%s)", exprSQLWithAliases(v.Args[0], aliases), joinExprsWithAliases(v.Args[1:], aliases))
 		default:
 			return identName(v.Func) + "(" + joinExprsWithAliases(v.Args, aliases) + ")"
 		}

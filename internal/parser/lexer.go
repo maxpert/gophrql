@@ -16,27 +16,29 @@ const (
 	STRING            = "STRING"
 	NEWLINE           = "NEWLINE"
 
-	LPAREN = "("
-	RPAREN = ")"
-	LBRACE = "{"
-	RBRACE = "}"
-	COMMA  = ","
-	EQUAL  = "="
-	DOT    = "."
-	PIPE   = "|"
-	STAR   = "*"
-	PLUS   = "+"
-	MINUS  = "-"
-	SLASH  = "/"
-	CARET  = "^"
-	POW    = "**"
-	RANGE  = ".."
-	EQ     = "=="
-	NEQ    = "!="
-	LT     = "<"
-	GT     = ">"
-	LTE    = "<="
-	GTE    = ">="
+	LPAREN  = "("
+	RPAREN  = ")"
+	LBRACE  = "{"
+	RBRACE  = "}"
+	COMMA   = ","
+	EQUAL   = "="
+	DOT     = "."
+	PIPE    = "|"
+	STAR    = "*"
+	PLUS    = "+"
+	MINUS   = "-"
+	SLASH   = "/"
+	CARET   = "^"
+	POW     = "**"
+	REGEXEQ = "~="
+	RANGE   = ".."
+	EQ      = "=="
+	NEQ     = "!="
+	PERCENT = "%"
+	LT      = "<"
+	GT      = ">"
+	LTE     = "<="
+	GTE     = ">="
 )
 
 type Token struct {
@@ -131,6 +133,9 @@ func Lex(input string) ([]Token, error) {
 			start := i
 			i++
 			for i < len(input) && isIdentPart(rune(input[i])) {
+				if input[i] == '.' && i+1 < len(input) && input[i+1] == '*' {
+					break
+				}
 				i++
 			}
 			tokens = append(tokens, Token{Typ: IDENT, Lit: input[start:i]})
@@ -140,6 +145,11 @@ func Lex(input string) ([]Token, error) {
 		// Multi-char operators.
 		if strings.HasPrefix(input[i:], "**") {
 			tokens = append(tokens, Token{Typ: POW, Lit: "**"})
+			i += 2
+			continue
+		}
+		if strings.HasPrefix(input[i:], "~=") {
+			tokens = append(tokens, Token{Typ: REGEXEQ, Lit: "~="})
 			i += 2
 			continue
 		}
@@ -197,6 +207,8 @@ func Lex(input string) ([]Token, error) {
 			tokens = append(tokens, Token{Typ: SLASH, Lit: "/"})
 		case '^':
 			tokens = append(tokens, Token{Typ: CARET, Lit: "^"})
+		case '%':
+			tokens = append(tokens, Token{Typ: PERCENT, Lit: "%"})
 		case '<':
 			tokens = append(tokens, Token{Typ: LT, Lit: "<"})
 		case '>':

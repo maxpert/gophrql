@@ -234,6 +234,49 @@ FROM
   employees
 `,
 		},
+		{
+			name: "pipelines_filters_sort_take",
+			prql: `
+from tracks
+
+filter (name ~= "Love")
+filter ((milliseconds / 1000 / 60) | in 3..4)
+sort track_id
+take 1..15
+select {name, composer}
+`,
+			wantSQL: `
+SELECT
+  name,
+  composer
+FROM
+  tracks
+WHERE
+  REGEXP(name, 'Love') AND milliseconds / 1000 / 60 BETWEEN 3 AND 4
+ORDER BY
+  track_id
+LIMIT
+  15
+`,
+		},
+		{
+			name: "distinct_group_take_one",
+			prql: `
+from tracks
+select {album_id, genre_id}
+group tracks.* (take 1)
+sort tracks.*
+`,
+			wantSQL: `
+SELECT
+  DISTINCT album_id,
+          genre_id
+FROM
+  tracks
+ORDER BY
+  album_id, genre_id
+`,
+		},
 	}
 
 	for _, tc := range cases {
