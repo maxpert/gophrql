@@ -14,6 +14,11 @@ func TestCompileErrors(t *testing.T) {
 		wantContains string
 	}{
 		{
+			name:         "comment_only",
+			prql:         `# just a comment`,
+			wantContains: "No PRQL query entered",
+		},
+		{
 			name:         "empty_query",
 			prql:         ``,
 			wantContains: "No PRQL query entered",
@@ -23,6 +28,15 @@ func TestCompileErrors(t *testing.T) {
 			prql: `
 let x = 5
 let y = 10
+`,
+			wantContains: "PRQL queries must begin with 'from'",
+		},
+		{
+			name: "declaration_only",
+			prql: `
+let x = 5
+let y = 10
+let z = 15
 `,
 			wantContains: "PRQL queries must begin with 'from'",
 		},
@@ -52,6 +66,14 @@ from employees
 take 1.8
 `,
 			wantContains: "`take` expected int or range",
+		},
+		{
+			name: "comment_then_empty",
+			prql: `
+# header
+  
+`,
+			wantContains: "No PRQL query entered",
 		},
 	}
 
