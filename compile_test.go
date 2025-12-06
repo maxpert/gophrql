@@ -117,37 +117,86 @@ append (
 filter (billing_country | text.starts_with("I"))
 `,
 			wantSQL: `
-WITH table_union AS (
-SELECT
-  *
-FROM
-  (
-    SELECT
-      invoice_id,
-      billing_country
-    FROM
-      invoices
-  ) AS table_2
-UNION
-ALL
-SELECT
-  *
-FROM
-  (
-    SELECT
-      invoice_id + 100 AS invoice_id,
-      billing_country
-    FROM
-      invoices
-  ) AS table_3
+WITH table_1 AS (
+  SELECT
+    invoice_id,
+    billing_country
+  FROM
+    invoices
+  UNION
+  ALL
+  SELECT
+    invoice_id + 100 AS invoice_id,
+    billing_country
+  FROM
+    invoices
 )
 SELECT
   invoice_id,
   billing_country
 FROM
-  table_union
+  table_1
 WHERE
   billing_country LIKE CONCAT('I', '%')
+`,
+		},
+		{
+			name: "append_select_compute",
+			prql: `
+from invoices
+derive total = case [total < 10 => total * 2, true => total]
+select { customer_id, invoice_id, total }
+take 5
+append (
+  from invoice_items
+  derive unit_price = case [unit_price < 1 => unit_price * 2, true => unit_price]
+  select { invoice_line_id, invoice_id, unit_price }
+  take 5
+)
+select { a = customer_id * 2, b = math.round 1 (invoice_id * total) }
+`,
+			wantSQL: `
+WITH table_1 AS (
+  SELECT
+    *
+  FROM
+    (
+      SELECT
+        invoice_id,
+        CASE
+          WHEN total < 10 THEN total * 2
+          ELSE total
+        END AS _expr_0,
+        customer_id
+      FROM
+        invoices
+      LIMIT
+        5
+    ) AS table_3
+  UNION
+  ALL
+  SELECT
+    *
+  FROM
+    (
+      SELECT
+        invoice_id,
+        CASE
+          WHEN unit_price < 1 THEN unit_price * 2
+          ELSE unit_price
+        END AS unit_price,
+        invoice_line_id
+      FROM
+        invoice_items
+      LIMIT
+        5
+    ) AS table_4
+)
+SELECT
+  customer_id * 2 AS a,
+  ROUND(invoice_id * _expr_0, 1) AS b
+FROM
+  table_1
 `,
 		},
 		{
@@ -314,6 +363,108 @@ FROM
       invoices
     LIMIT
       6 OFFSET 39
+  ) AS table_3
+`,
+		},
+		{
+			name: "append_select_multiple_with_null",
+			prql: `
+from invoices
+select { customer_id, invoice_id, billing_country }
+take 5
+append (
+  from employees
+  select { employee_id, employee_id, country }
+  take 5
+)
+append (
+  from invoice_items
+  select { invoice_line_id, invoice_id, null }
+  take 5
+)
+select { billing_country, invoice_id }
+`,
+			wantSQL: `
+SELECT
+  *
+FROM
+  (
+    SELECT
+      billing_country,
+      invoice_id
+    FROM
+      invoices
+    LIMIT
+      5
+  ) AS table_4
+UNION
+ALL
+SELECT
+  *
+FROM
+  (
+    SELECT
+      country,
+      employee_id
+    FROM
+      employees
+    LIMIT
+      5
+  ) AS table_5
+UNION
+ALL
+SELECT
+  *
+FROM
+  (
+    SELECT
+      NULL,
+      invoice_id
+    FROM
+      invoice_items
+    LIMIT
+      5
+  ) AS table_6
+`,
+		},
+		{
+			name: "append_select_nulls",
+			prql: `
+from invoices
+select {an_id = invoice_id, name = null}
+take 2
+append (
+  from employees
+  select {an_id = null, name = first_name}
+  take 2
+)
+`,
+			wantSQL: `
+SELECT
+  *
+FROM
+  (
+    SELECT
+      invoice_id AS an_id,
+      NULL AS name
+    FROM
+      invoices
+    LIMIT
+      2
+  ) AS table_2
+UNION
+ALL
+SELECT
+  *
+FROM
+  (
+    SELECT
+      NULL AS an_id,
+      first_name AS name
+    FROM
+      employees
+    LIMIT
+      2
   ) AS table_3
 `,
 		},

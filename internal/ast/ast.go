@@ -69,7 +69,7 @@ type (
 		On    Expr
 	}
 	DistinctStep struct{}
-	GroupStep struct {
+	GroupStep    struct {
 		Key   Expr
 		Steps []Step
 	}
@@ -123,6 +123,13 @@ type (
 		Func  Expr
 		Args  []Expr
 	}
+	CaseExpr struct {
+		Branches []CaseBranch
+	}
+	CaseBranch struct {
+		Cond  Expr
+		Value Expr
+	}
 	Tuple struct {
 		Exprs []Expr
 	}
@@ -134,4 +141,5 @@ func (*StringLit) isExpr() {}
 func (*Binary) isExpr()    {}
 func (*Call) isExpr()      {}
 func (*Pipe) isExpr()      {}
+func (*CaseExpr) isExpr()  {}
 func (*Tuple) isExpr()     {}

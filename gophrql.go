@@ -70,6 +70,7 @@ func isCommentOnly(q string) bool {
 func semanticChecks(q *ast.Query) error {
 	cols := map[string]bool{}
 	joinSeen := false
+	appendSeen := false
 
 	for _, step := range q.Steps {
 		switch s := step.(type) {
@@ -100,6 +101,9 @@ func semanticChecks(q *ast.Query) error {
 			if joinSeen {
 				continue
 			}
+			if appendSeen {
+				continue
+			}
 			for _, it := range s.Items {
 				name := sqlgen.ExprName(it.Expr)
 				if it.As != "" {
@@ -114,6 +118,8 @@ func semanticChecks(q *ast.Query) error {
 			_ = s
 		case *ast.JoinStep:
 			joinSeen = true
+		case *ast.AppendStep:
+			appendSeen = true
 		}
 	}
 	return nil

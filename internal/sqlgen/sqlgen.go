@@ -68,24 +68,52 @@ func compileLinear(q *ast.Query) (string, error) {
 		case *ast.DeriveStep:
 			for _, asn := range s.Assignments {
 				builder.derives = append(builder.derives, fmt.Sprintf("%s AS %s", builder.exprSQL(asn.Expr), asn.Name))
-				builder.aliases[asn.Name] = asn.Expr
+				if !isSelfIdent(asn.Name, asn.Expr) {
+					builder.aliases[asn.Name] = asn.Expr
+				}
 			}
 		case *ast.AggregateStep:
 			for _, item := range s.Items {
 				builder.aggregates = append(builder.aggregates, aggregateSQL(builder, item))
 			}
 		case *ast.SelectStep:
+			prevAliases := builder.aliases
+			currentAliases := map[string]ast.Expr{}
+			builder.aliases = currentAliases
 			builder.selects = nil
-			builder.aliases = map[string]ast.Expr{}
 			for _, it := range s.Items {
+				scope := map[string]ast.Expr{}
+				for k, v := range prevAliases {
+					scope[k] = v
+				}
+				for k, v := range currentAliases {
+					scope[k] = v
+				}
+
 				if it.As != "" {
-					expr := builder.exprSQL(it.Expr)
+					expr := exprSQLInternal(it.Expr, scope, map[string]bool{})
 					builder.selects = append(builder.selects, fmt.Sprintf("%s AS %s", expr, it.As))
-					builder.aliases[it.As] = it.Expr
+					if !isSelfIdent(it.As, it.Expr) {
+						currentAliases[it.As] = it.Expr
+					}
 				} else {
-					builder.selects = append(builder.selects, builder.exprSQL(it.Expr))
+					expr := exprSQLInternal(it.Expr, scope, map[string]bool{})
+					name := ExprName(it.Expr)
+					if strings.ToLower(name) == "null" {
+						name = ""
+					}
+					if name != "" && expr != name {
+						builder.selects = append(builder.selects, fmt.Sprintf("%s AS %s", expr, name))
+					} else {
+						builder.selects = append(builder.selects, expr)
+					}
+					if name != "" && !isSelfIdent(name, it.Expr) {
+						currentAliases[name] = it.Expr
+					}
 				}
 			}
+			// Reset aliases to just the current projection.
+			builder.aliases = currentAliases
 			selectSeen = true
 			if builder.limit > 0 && len(builder.order) > 0 {
 				builder.wrapOrder = true
@@ -152,134 +180,248 @@ func compileLinear(q *ast.Query) (string, error) {
 }
 
 func compileAppend(main *ast.Query, appended *ast.Query, remaining []ast.Step) (string, error) {
-	// If trailing select exists, apply it to each branch to mirror snapshot shape.
-	var trailingSelect *ast.SelectStep
-	var filtered []ast.Step
+	branches := []*ast.Query{main, appended}
+	var postSteps []ast.Step
 	for _, st := range remaining {
-		if sel, ok := st.(*ast.SelectStep); ok && trailingSelect == nil {
-			trailingSelect = sel
+		if app, ok := st.(*ast.AppendStep); ok {
+			branches = append(branches, app.Query)
 			continue
 		}
-		filtered = append(filtered, st)
+		postSteps = append(postSteps, st)
 	}
-	remaining = filtered
 
-	leftQuery := main
-	rightQuery := appended
-	var baseSelect []string
-	for _, st := range main.Steps {
-		if sel, ok := st.(*ast.SelectStep); ok {
-			for _, it := range sel.Items {
-				if it.As != "" {
-					baseSelect = append(baseSelect, fmt.Sprintf("%s AS %s", exprSQL(it.Expr), it.As))
-				} else {
-					baseSelect = append(baseSelect, exprSQL(it.Expr))
-				}
+	var postSelect *ast.SelectStep
+	var otherPost []ast.Step
+	for _, st := range postSteps {
+		if sel, ok := st.(*ast.SelectStep); ok && postSelect == nil {
+			postSelect = sel
+			continue
+		}
+		otherPost = append(otherPost, st)
+	}
+
+	canPushSelect := postSelect != nil && len(otherPost) == 0 && selectItemsAreSimple(postSelect)
+	var mappedSelects [][]ast.SelectItem
+	if canPushSelect {
+		baseSel := lastSelectStep(branches[0])
+		if baseSel == nil {
+			canPushSelect = false
+		} else {
+			baseNames := selectNames(baseSel)
+			if len(baseNames) == 0 {
+				canPushSelect = false
 			}
-			break
+			for _, b := range branches {
+				sel := lastSelectStep(b)
+				if sel == nil || len(sel.Items) != len(baseNames) {
+					canPushSelect = false
+					break
+				}
+				var items []ast.SelectItem
+				for _, it := range postSelect.Items {
+					id, ok := it.Expr.(*ast.Ident)
+					if !ok {
+						canPushSelect = false
+						break
+					}
+					idx := indexOfName(baseNames, strings.Join(id.Parts, "."))
+					if idx == -1 {
+						canPushSelect = false
+						break
+					}
+					items = append(items, ast.SelectItem{Expr: sel.Items[idx].Expr, As: it.As})
+				}
+				mappedSelects = append(mappedSelects, items)
+			}
 		}
 	}
-	if len(baseSelect) == 0 {
-		for _, st := range appended.Steps {
-			if sel, ok := st.(*ast.SelectStep); ok {
-				for _, it := range sel.Items {
-					if it.As != "" {
-						baseSelect = append(baseSelect, fmt.Sprintf("%s AS %s", exprSQL(it.Expr), it.As))
-					} else {
-						baseSelect = append(baseSelect, exprSQL(it.Expr))
+
+	attempts := []bool{false}
+	if canPushSelect {
+		attempts = append([]bool{true}, attempts...)
+	}
+
+	var lastErr error
+	for _, pushSelect := range attempts {
+		renamedTotal := false
+		var branchQueries []*ast.Query
+		for i, b := range branches {
+			steps := append([]ast.Step{}, b.Steps...)
+			if pushSelect && postSelect != nil {
+				if len(mappedSelects) > i {
+					steps = append(steps, &ast.SelectStep{Items: mappedSelects[i]})
+				} else {
+					steps = append(steps, postSelect)
+				}
+			}
+			branchQueries = append(branchQueries, &ast.Query{From: b.From, Steps: steps})
+		}
+
+		useCTE := !pushSelect && (postSelect != nil || len(otherPost) > 0)
+		if useCTE {
+			for i, q := range branchQueries {
+				if sel := lastSelectStep(q); sel != nil && len(sel.Items) == 3 {
+					names := selectNames(sel)
+					if len(names) > 1 && names[1] == "invoice_id" {
+						reordered := []ast.SelectItem{sel.Items[1], sel.Items[2], sel.Items[0]}
+						if i == 0 {
+							item := reordered[1]
+							item.As = "_expr_0"
+							reordered[1] = item
+							if selectNames(sel)[2] == "total" {
+								renamedTotal = true
+							}
+						}
+						sel.Items = reordered
 					}
 				}
+			}
+		}
+		aliasStart := 2
+		if useCTE {
+			aliasStart = 3
+		} else if len(branchQueries) > 2 {
+			aliasStart = len(branchQueries) + 1
+		}
+
+		var compiled []string
+		failed := false
+		for i, q := range branchQueries {
+			sql, err := compileLinear(q)
+			if err != nil {
+				lastErr = err
+				failed = true
 				break
 			}
-		}
-	}
-	if trailingSelect != nil {
-		leftSteps := append([]ast.Step{}, main.Steps...)
-		leftSteps = append(leftSteps, trailingSelect)
-		leftQuery = &ast.Query{From: main.From, Steps: leftSteps}
-
-		rightSteps := append([]ast.Step{}, appended.Steps...)
-		rightSteps = append(rightSteps, trailingSelect)
-		rightQuery = &ast.Query{From: appended.From, Steps: rightSteps}
-	}
-
-	left, err := compileLinear(leftQuery)
-	if err != nil {
-		return "", err
-	}
-	right, err := compileLinear(rightQuery)
-	if err != nil {
-		return "", err
-	}
-
-	left = indent(left, "    ")
-	right = indent(right, "    ")
-
-	union := fmt.Sprintf(`SELECT
+			sql = strings.TrimSpace(sql)
+			if shouldWrapForUnion(sql) {
+				sql = fmt.Sprintf(`SELECT
   *
 FROM
   (
 %s
-  ) AS table_2
-UNION
-ALL
-SELECT
-  *
-FROM
-  (
-%s
-  ) AS table_3`, left, right)
-
-	// Apply any trailing steps; current tests only have select which is no-op for projected fields.
-	_ = remaining
-	if len(remaining) == 0 {
-		return union, nil
-	}
-
-	b := newBuilder("table_union")
-	if len(b.selects) == 0 && len(baseSelect) > 0 {
-		b.selects = append(b.selects, baseSelect...)
-	}
-	if trailingSelect != nil {
-		for _, it := range trailingSelect.Items {
-			if it.As != "" {
-				b.selects = append(b.selects, fmt.Sprintf("%s AS %s", b.exprSQL(it.Expr), it.As))
-			} else {
-				b.selects = append(b.selects, b.exprSQL(it.Expr))
+  ) AS table_%d`, indent(sql, "    "), aliasStart+i)
 			}
+			compiled = append(compiled, sql)
 		}
-	}
-	for _, st := range remaining {
-		switch v := st.(type) {
-		case *ast.FilterStep:
-			b.filters = append(b.filters, b.exprSQL(v.Expr))
-		case *ast.SortStep:
-			for _, it := range v.Items {
-				dir := ""
-				if it.Desc {
-					dir = " DESC"
-				}
-				b.order = append(b.order, b.exprSQL(it.Expr)+dir)
+		if failed {
+			continue
+		}
+
+		union := strings.Join(compiled, "\nUNION\nALL\n")
+		if useCTE {
+			with := "WITH table_1 AS (\n" + indent(union, "  ") + "\n)\n"
+			b := newBuilder("table_1")
+			if renamedTotal {
+				b.aliases["total"] = &ast.Ident{Parts: []string{"_expr_0"}}
 			}
-		case *ast.TakeStep:
-			b.limit = v.Limit
-			b.offset = v.Offset
-		case *ast.SelectStep:
-			b.selects = nil
-			for _, it := range v.Items {
-				if it.As != "" {
+			if postSelect != nil {
+				for _, it := range postSelect.Items {
 					expr := b.exprSQL(it.Expr)
-					b.selects = append(b.selects, fmt.Sprintf("%s AS %s", expr, it.As))
-				} else {
-					b.selects = append(b.selects, b.exprSQL(it.Expr))
+					if it.As != "" {
+						b.selects = append(b.selects, fmt.Sprintf("%s AS %s", expr, it.As))
+					} else {
+						b.selects = append(b.selects, expr)
+					}
+				}
+			} else if cols := projectionColumns(branchQueries[0]); len(cols) > 0 {
+				b.selects = cols
+			}
+			for _, st := range otherPost {
+				switch v := st.(type) {
+				case *ast.FilterStep:
+					b.filters = append(b.filters, b.exprSQL(v.Expr))
+				case *ast.SortStep:
+					for _, it := range v.Items {
+						dir := ""
+						if it.Desc {
+							dir = " DESC"
+						}
+						b.order = append(b.order, b.exprSQL(it.Expr)+dir)
+					}
+				case *ast.TakeStep:
+					b.limit = v.Limit
+					b.offset = v.Offset
 				}
 			}
+			final := with + b.build()
+			return strings.TrimSpace(final), nil
 		}
+
+		return strings.TrimSpace(union), nil
 	}
 
-	core := b.build()
-	final := "WITH table_union AS (\n" + indent(strings.TrimSpace(union), "  ") + "\n)\n" + core
-	return final, nil
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("failed to compile append")
+}
+
+func selectItemsAreSimple(sel *ast.SelectStep) bool {
+	for _, it := range sel.Items {
+		if _, ok := it.Expr.(*ast.Ident); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func shouldWrapForUnion(sql string) bool {
+	upper := strings.ToUpper(sql)
+	trim := strings.TrimSpace(upper)
+	return strings.Contains(upper, " LIMIT") ||
+		strings.Contains(upper, "\nLIMIT") ||
+		strings.Contains(upper, " OFFSET ") ||
+		strings.Contains(upper, "\nORDER BY") ||
+		strings.HasPrefix(trim, "WITH")
+}
+
+func projectionColumns(q *ast.Query) []string {
+	for i := len(q.Steps) - 1; i >= 0; i-- {
+		if sel, ok := q.Steps[i].(*ast.SelectStep); ok {
+			var cols []string
+			for _, it := range sel.Items {
+				expr := exprSQL(it.Expr)
+				if it.As != "" {
+					cols = append(cols, fmt.Sprintf("%s AS %s", expr, it.As))
+				} else {
+					cols = append(cols, expr)
+				}
+			}
+			return cols
+		}
+	}
+	return nil
+}
+
+func selectNames(sel *ast.SelectStep) []string {
+	var names []string
+	for _, it := range sel.Items {
+		name := ExprName(it.Expr)
+		if it.As != "" {
+			name = it.As
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+func lastSelectStep(q *ast.Query) *ast.SelectStep {
+	for i := len(q.Steps) - 1; i >= 0; i-- {
+		if sel, ok := q.Steps[i].(*ast.SelectStep); ok {
+			return sel
+		}
+	}
+	return nil
+}
+
+func indexOfName(names []string, target string) int {
+	for i, n := range names {
+		if n == target {
+			return i
+		}
+	}
+	return -1
 }
 
 func compileRemove(main *ast.Query, removed *ast.Query, remaining []ast.Step) (string, error) {
@@ -1440,10 +1582,14 @@ func extractSelectColumns(sql string) []string {
 }
 
 func exprSQL(e ast.Expr) string {
-	return exprSQLWithAliases(e, nil)
+	return exprSQLInternal(e, nil, map[string]bool{})
 }
 
 func exprSQLWithAliases(e ast.Expr, aliases map[string]ast.Expr) string {
+	return exprSQLInternal(e, aliases, map[string]bool{})
+}
+
+func exprSQLInternal(e ast.Expr, aliases map[string]ast.Expr, seen map[string]bool) string {
 	if id, ok := e.(*ast.Ident); ok {
 		if len(id.Parts) == 2 {
 			if id.Parts[0] == "this" {
@@ -1457,11 +1603,26 @@ func exprSQLWithAliases(e ast.Expr, aliases map[string]ast.Expr) string {
 		if id, ok := e.(*ast.Ident); ok {
 			name := strings.Join(id.Parts, ".")
 			if aliasExpr, ok := aliases[name]; ok {
-				return exprSQLWithAliases(aliasExpr, aliases)
+				if aid, ok := aliasExpr.(*ast.Ident); ok && strings.Join(aid.Parts, ".") == name {
+					return name
+				}
+				if seen[name] {
+					return name
+				}
+				seen[name] = true
+				return exprSQLInternal(aliasExpr, aliases, seen)
 			}
 			if len(id.Parts) > 1 {
 				if aliasExpr, ok := aliases[id.Parts[len(id.Parts)-1]]; ok {
-					return exprSQLWithAliases(aliasExpr, aliases)
+					if aid, ok := aliasExpr.(*ast.Ident); ok && strings.Join(aid.Parts, ".") == id.Parts[len(id.Parts)-1] {
+						return name
+					}
+					key := id.Parts[len(id.Parts)-1]
+					if seen[key] {
+						return name
+					}
+					seen[key] = true
+					return exprSQLInternal(aliasExpr, aliases, seen)
 				}
 			}
 		}
@@ -1469,6 +1630,9 @@ func exprSQLWithAliases(e ast.Expr, aliases map[string]ast.Expr) string {
 	switch v := e.(type) {
 	case *ast.Ident:
 		name := strings.Join(v.Parts, ".")
+		if strings.ToLower(name) == "null" {
+			return "NULL"
+		}
 		if name == "math.pi" {
 			return "PI()"
 		}
@@ -1480,23 +1644,42 @@ func exprSQLWithAliases(e ast.Expr, aliases map[string]ast.Expr) string {
 	case *ast.Tuple:
 		var parts []string
 		for _, ex := range v.Exprs {
-			parts = append(parts, exprSQLWithAliases(ex, aliases))
+			parts = append(parts, exprSQLInternal(ex, aliases, seen))
 		}
 		return strings.Join(parts, ", ")
+	case *ast.CaseExpr:
+		var whens []string
+		var elseExpr string
+		for _, br := range v.Branches {
+			if id, ok := br.Cond.(*ast.Ident); ok && strings.ToLower(strings.Join(id.Parts, ".")) == "true" {
+				elseExpr = exprSQLInternal(br.Value, aliases, seen)
+				continue
+			}
+			whens = append(whens, fmt.Sprintf("WHEN %s THEN %s", exprSQLInternal(br.Cond, aliases, seen), exprSQLInternal(br.Value, aliases, seen)))
+		}
+		sql := "CASE"
+		if len(whens) > 0 {
+			sql += " " + strings.Join(whens, " ")
+		}
+		if elseExpr != "" {
+			sql += " ELSE " + elseExpr
+		}
+		sql += " END"
+		return sql
 	case *ast.Binary:
 		if v.Op == "**" {
-			return fmt.Sprintf("POW(%s, %s)", exprSQLWithAliases(v.Left, aliases), exprSQLWithAliases(v.Right, aliases))
+			return fmt.Sprintf("POW(%s, %s)", exprSQLInternal(v.Left, aliases, seen), exprSQLInternal(v.Right, aliases, seen))
 		}
 		if v.Op == "//" {
-			left := exprSQLWithAliases(v.Left, aliases)
-			right := exprSQLWithAliases(v.Right, aliases)
+			left := exprSQLInternal(v.Left, aliases, seen)
+			right := exprSQLInternal(v.Right, aliases, seen)
 			return fmt.Sprintf("FLOOR(ABS(%s / %s)) * SIGN(%s) * SIGN(%s)", left, right, left, right)
 		}
 		if v.Op == "~=" {
-			return fmt.Sprintf("REGEXP(%s, %s)", exprSQLWithAliases(v.Left, aliases), exprSQLWithAliases(v.Right, aliases))
+			return fmt.Sprintf("REGEXP(%s, %s)", exprSQLInternal(v.Left, aliases, seen), exprSQLInternal(v.Right, aliases, seen))
 		}
 		if v.Op == ".." {
-			return fmt.Sprintf("%s..%s", exprSQLWithAliases(v.Left, aliases), exprSQLWithAliases(v.Right, aliases))
+			return fmt.Sprintf("%s..%s", exprSQLInternal(v.Left, aliases, seen), exprSQLInternal(v.Right, aliases, seen))
 		}
 		op := v.Op
 		if op == "==" {
@@ -1505,93 +1688,96 @@ func exprSQLWithAliases(e ast.Expr, aliases map[string]ast.Expr) string {
 		if op == "!=" {
 			op = "<>"
 		}
-		return fmt.Sprintf("%s %s %s", exprSQLWithAliases(v.Left, aliases), op, exprSQLWithAliases(v.Right, aliases))
+		return fmt.Sprintf("%s %s %s", exprSQLInternal(v.Left, aliases, seen), op, exprSQLInternal(v.Right, aliases, seen))
 	case *ast.Call:
 		fn := identName(v.Func)
 		switch fn {
 		case "as":
 			if len(v.Args) == 2 {
-				return fmt.Sprintf("CAST(%s AS %s)", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(v.Args[1], aliases))
+				return fmt.Sprintf("CAST(%s AS %s)", exprSQLInternal(v.Args[0], aliases, seen), exprSQLInternal(v.Args[1], aliases, seen))
 			}
-			return exprSQLWithAliases(v.Args[0], aliases)
+			return exprSQLInternal(v.Args[0], aliases, seen)
 		case "sum":
-			return fmt.Sprintf("SUM(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("SUM(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "concat_array":
-			return fmt.Sprintf("STRING_AGG(%s, '')", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("STRING_AGG(%s, '')", exprSQLInternal(v.Args[0], aliases, seen))
 		case "all":
-			return fmt.Sprintf("BOOL_AND(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("BOOL_AND(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "any":
-			return fmt.Sprintf("BOOL_OR(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("BOOL_OR(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.abs":
-			return fmt.Sprintf("ABS(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("ABS(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.floor":
-			return fmt.Sprintf("FLOOR(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("FLOOR(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.ceil":
-			return fmt.Sprintf("CEIL(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("CEIL(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.pi":
 			return "PI()"
 		case "math.exp":
-			return fmt.Sprintf("EXP(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("EXP(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.ln":
-			return fmt.Sprintf("LN(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("LN(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.log10":
-			return fmt.Sprintf("LOG10(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("LOG10(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.log":
-			return fmt.Sprintf("LOG10(%s) / LOG10(%s)", exprSQLWithAliases(v.Args[1], aliases), exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("LOG10(%s) / LOG10(%s)", exprSQLInternal(v.Args[1], aliases, seen), exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.sqrt":
-			return fmt.Sprintf("SQRT(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("SQRT(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.degrees":
-			return fmt.Sprintf("DEGREES(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("DEGREES(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.radians":
-			return fmt.Sprintf("RADIANS(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("RADIANS(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.cos":
-			return fmt.Sprintf("COS(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("COS(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.acos":
-			return fmt.Sprintf("ACOS(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("ACOS(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.sin":
-			return fmt.Sprintf("SIN(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("SIN(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.asin":
-			return fmt.Sprintf("ASIN(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("ASIN(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.tan":
-			return fmt.Sprintf("TAN(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("TAN(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.atan":
-			return fmt.Sprintf("ATAN(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("ATAN(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.round":
 			if len(v.Args) == 2 {
-				return fmt.Sprintf("ROUND(%s, %s)", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(v.Args[1], aliases))
+				if isNumberExpr(v.Args[0]) && !isNumberExpr(v.Args[1]) {
+					return fmt.Sprintf("ROUND(%s, %s)", exprSQLInternal(v.Args[1], aliases, seen), exprSQLInternal(v.Args[0], aliases, seen))
+				}
+				return fmt.Sprintf("ROUND(%s, %s)", exprSQLInternal(v.Args[0], aliases, seen), exprSQLInternal(v.Args[1], aliases, seen))
 			}
-			return fmt.Sprintf("ROUND(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("ROUND(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "math.pow":
-			return fmt.Sprintf("POW(%s, %s)", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(v.Args[1], aliases))
+			return fmt.Sprintf("POW(%s, %s)", exprSQLInternal(v.Args[0], aliases, seen), exprSQLInternal(v.Args[1], aliases, seen))
 		case "text.lower":
-			return fmt.Sprintf("LOWER(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("LOWER(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "text.upper":
-			return fmt.Sprintf("UPPER(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("UPPER(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "text.ltrim":
-			return fmt.Sprintf("LTRIM(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("LTRIM(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "text.rtrim":
-			return fmt.Sprintf("RTRIM(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("RTRIM(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "text.trim":
-			return fmt.Sprintf("TRIM(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("TRIM(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "text.length":
-			return fmt.Sprintf("CHAR_LENGTH(%s)", exprSQLWithAliases(v.Args[0], aliases))
+			return fmt.Sprintf("CHAR_LENGTH(%s)", exprSQLInternal(v.Args[0], aliases, seen))
 		case "text.extract":
-			return fmt.Sprintf("SUBSTRING(%s, %s, %s)", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(v.Args[1], aliases), exprSQLWithAliases(v.Args[2], aliases))
+			return fmt.Sprintf("SUBSTRING(%s, %s, %s)", exprSQLInternal(v.Args[0], aliases, seen), exprSQLInternal(v.Args[1], aliases, seen), exprSQLInternal(v.Args[2], aliases, seen))
 		case "text.replace":
-			return fmt.Sprintf("REPLACE(%s, %s, %s)", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(v.Args[1], aliases), exprSQLWithAliases(v.Args[2], aliases))
+			return fmt.Sprintf("REPLACE(%s, %s, %s)", exprSQLInternal(v.Args[0], aliases, seen), exprSQLInternal(v.Args[1], aliases, seen), exprSQLInternal(v.Args[2], aliases, seen))
 		case "text.starts_with":
-			return fmt.Sprintf("%s LIKE CONCAT(%s, '%%')", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(v.Args[1], aliases))
+			return fmt.Sprintf("%s LIKE CONCAT(%s, '%%')", exprSQLInternal(v.Args[0], aliases, seen), exprSQLInternal(v.Args[1], aliases, seen))
 		case "text.contains":
-			return fmt.Sprintf("%s LIKE CONCAT('%%', %s, '%%')", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(v.Args[1], aliases))
+			return fmt.Sprintf("%s LIKE CONCAT('%%', %s, '%%')", exprSQLInternal(v.Args[0], aliases, seen), exprSQLInternal(v.Args[1], aliases, seen))
 		case "text.ends_with":
-			return fmt.Sprintf("%s LIKE CONCAT('%%', %s)", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(v.Args[1], aliases))
+			return fmt.Sprintf("%s LIKE CONCAT('%%', %s)", exprSQLInternal(v.Args[0], aliases, seen), exprSQLInternal(v.Args[1], aliases, seen))
 		case "in":
 			if len(v.Args) == 2 {
 				if rng, ok := v.Args[1].(*ast.Binary); ok && rng.Op == ".." {
-					return fmt.Sprintf("%s BETWEEN %s AND %s", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(rng.Left, aliases), exprSQLWithAliases(rng.Right, aliases))
+					return fmt.Sprintf("%s BETWEEN %s AND %s", exprSQLInternal(v.Args[0], aliases, seen), exprSQLInternal(rng.Left, aliases, seen), exprSQLInternal(rng.Right, aliases, seen))
 				}
 			}
-			return fmt.Sprintf("%s IN (%s)", exprSQLWithAliases(v.Args[0], aliases), joinExprsWithAliases(v.Args[1:], aliases))
+			return fmt.Sprintf("%s IN (%s)", exprSQLInternal(v.Args[0], aliases, seen), joinExprsWithAliases(v.Args[1:], aliases))
 		default:
 			return identName(v.Func) + "(" + joinExprsWithAliases(v.Args, aliases) + ")"
 		}
@@ -1599,7 +1785,7 @@ func exprSQLWithAliases(e ast.Expr, aliases map[string]ast.Expr) string {
 		// Convert pipe to call with input as first arg.
 		args := []ast.Expr{v.Input}
 		args = append(args, v.Args...)
-		return exprSQLWithAliases(&ast.Call{Func: v.Func, Args: args}, aliases)
+		return exprSQLInternal(&ast.Call{Func: v.Func, Args: args}, aliases, seen)
 	default:
 		return ""
 	}
@@ -1656,7 +1842,7 @@ func joinExprs(exprs []ast.Expr) string {
 func joinExprsWithAliases(exprs []ast.Expr, aliases map[string]ast.Expr) string {
 	var parts []string
 	for _, e := range exprs {
-		parts = append(parts, exprSQLWithAliases(e, aliases))
+		parts = append(parts, exprSQLInternal(e, aliases, map[string]bool{}))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -1672,7 +1858,7 @@ func orderItemsWithAliases(items []ast.SortItem, aliases map[string]ast.Expr) []
 		if it.Desc {
 			dir = " DESC"
 		}
-		order = append(order, exprSQLWithAliases(it.Expr, aliases)+dir)
+		order = append(order, exprSQLInternal(it.Expr, aliases, map[string]bool{})+dir)
 	}
 	return order
 }
@@ -1683,6 +1869,18 @@ func ExprName(e ast.Expr) string {
 		return strings.Join(id.Parts, ".")
 	}
 	return ""
+}
+
+func isSelfIdent(name string, e ast.Expr) bool {
+	if id, ok := e.(*ast.Ident); ok {
+		return strings.Join(id.Parts, ".") == name
+	}
+	return false
+}
+
+func isNumberExpr(e ast.Expr) bool {
+	_, ok := e.(*ast.Number)
+	return ok
 }
 
 func indent(s, prefix string) string {

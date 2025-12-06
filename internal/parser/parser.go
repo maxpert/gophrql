@@ -732,7 +732,7 @@ func (p *Parser) parseExpr(precedence int) (ast.Expr, error) {
 	}
 
 	for {
-		if p.peekIs(EOF) || p.peekIs(NEWLINE) || p.peekIs(COMMA) || p.peekIs(RBRACE) || p.peekIs(RPAREN) {
+		if p.peekIs(EOF) || p.peekIs(NEWLINE) || p.peekIs(COMMA) || p.peekIs(RBRACE) || p.peekIs(RPAREN) || p.peekIs(RBRACKET) {
 			break
 		}
 
@@ -797,6 +797,9 @@ func (p *Parser) parsePrefix() (ast.Expr, error) {
 	tok := p.next()
 	switch tok.Typ {
 	case IDENT:
+		if tok.Lit == "case" && p.peekIs(LBRACKET) {
+			return p.parseCase()
+		}
 		if p.peekIs(DOT) && p.peekN(1).Typ == STAR {
 			p.next()
 			p.next()
@@ -830,6 +833,36 @@ func (p *Parser) parsePrefix() (ast.Expr, error) {
 	default:
 		return nil, fmt.Errorf("unexpected token %v at pos %d", tok, p.pos-1)
 	}
+}
+
+func (p *Parser) parseCase() (ast.Expr, error) {
+	p.next() // consume '['
+	var branches []ast.CaseBranch
+	for {
+		p.skipNewlines()
+		if p.peekIs(RBRACKET) {
+			p.next()
+			break
+		}
+		cond, err := p.parseExpr(0)
+		if err != nil {
+			return nil, err
+		}
+		if !p.peekIs(ARROW) {
+			return nil, fmt.Errorf("expected => in case expression")
+		}
+		p.next()
+		val, err := p.parseExpr(0)
+		if err != nil {
+			return nil, err
+		}
+		branches = append(branches, ast.CaseBranch{Cond: cond, Value: val})
+		p.skipNewlines()
+		if p.peekIs(COMMA) {
+			p.next()
+		}
+	}
+	return &ast.CaseExpr{Branches: branches}, nil
 }
 
 // Helpers

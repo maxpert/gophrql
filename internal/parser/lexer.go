@@ -36,6 +36,7 @@ const (
 	POW      = "**"
 	REGEXEQ  = "~="
 	RANGE    = ".."
+	ARROW    = "=>"
 	EQ       = "=="
 	NEQ      = "!="
 	PERCENT  = "%"
@@ -200,6 +201,11 @@ func Lex(input string) ([]Token, error) {
 		}
 		if strings.HasPrefix(input[i:], "..") {
 			tokens = append(tokens, Token{Typ: RANGE, Lit: ".."})
+			i += 2
+			continue
+		}
+		if strings.HasPrefix(input[i:], "=>") {
+			tokens = append(tokens, Token{Typ: ARROW, Lit: "=>"})
 			i += 2
 			continue
 		}
