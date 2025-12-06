@@ -25,6 +25,7 @@ const (
 	COMMA    = ","
 	EQUAL    = "="
 	DOT      = "."
+	BACKTICK = "`"
 	PIPE     = "|"
 	STAR     = "*"
 	PLUS     = "+"
@@ -90,6 +91,22 @@ func Lex(input string) ([]Token, error) {
 			lit := input[start:i]
 			i++ // closing '
 			tokens = append(tokens, Token{Typ: STRING, Lit: lit})
+			continue
+		}
+
+		// Backtick identifiers.
+		if ch == '`' {
+			start := i + 1
+			i++
+			for i < len(input) && input[i] != '`' {
+				i++
+			}
+			if i >= len(input) {
+				return nil, fmt.Errorf("unterminated backtick identifier")
+			}
+			lit := input[start:i]
+			i++
+			tokens = append(tokens, Token{Typ: IDENT, Lit: lit})
 			continue
 		}
 
@@ -240,5 +257,5 @@ func isIdentStart(r rune) bool {
 }
 
 func isIdentPart(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '.'
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '.' || r == ':'
 }

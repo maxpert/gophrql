@@ -20,7 +20,8 @@ func Compile(prql string) (string, error) {
 		return "", fmt.Errorf("[E0001] Error: No PRQL query entered")
 	}
 
-	if !strings.HasPrefix(trimmed, "from") && !strings.Contains(trimmed, "\nfrom ") {
+	// Allow let bindings before the first from; parser will validate.
+	if !strings.Contains(trimmed, "from") && !strings.Contains(trimmed, "s\"") {
 		return "", fmt.Errorf("[E0001] Error: PRQL queries must begin with 'from'\n↳ Hint: A query must start with a 'from' statement to define the main pipeline")
 	}
 

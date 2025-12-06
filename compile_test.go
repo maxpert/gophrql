@@ -380,6 +380,127 @@ ORDER BY
   id
 `,
 		},
+		{
+			name: "set_ops_remove",
+			prql: `
+let distinct = rel -> (from t = _param.rel | group {t.*} (take 1))
+
+from_text format:json '{ "columns": ["a"], "data": [[1], [2], [2], [3]] }'
+distinct
+remove (from_text format:json '{ "columns": ["a"], "data": [[1], [2]] }')
+sort a
+`,
+			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    1 AS a
+  UNION
+  ALL
+  SELECT
+    2 AS a
+  UNION
+  ALL
+  SELECT
+    2 AS a
+  UNION
+  ALL
+  SELECT
+    3 AS a
+),
+table_1 AS (
+  SELECT
+    1 AS a
+  UNION
+  ALL
+  SELECT
+    2 AS a
+),
+table_2 AS (
+  SELECT
+    a
+  FROM
+    table_0
+  EXCEPT
+    DISTINCT
+  SELECT
+    *
+  FROM
+    table_1
+)
+SELECT
+  a
+FROM
+  table_2
+ORDER BY
+  a
+`,
+		},
+		{
+			name: "group_sort_derive_select_join",
+			prql: `
+s"SELECT album_id,title,artist_id FROM albums"
+group {artist_id} (aggregate { album_title_count = count this.` + "`title`" + `})
+sort {this.artist_id, this.album_title_count}
+derive {new_album_count = this.album_title_count}
+select {this.artist_id, this.new_album_count}
+join side:left ( s"SELECT artist_id,name as artist_name FROM artists" ) (this.artist_id == that.artist_id)
+`,
+			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    album_id,
+    title,
+    artist_id
+  FROM
+    albums
+),
+table_4 AS (
+  SELECT
+    artist_id,
+    COUNT(*) AS _expr_0
+  FROM
+    table_0
+  GROUP BY
+    artist_id
+),
+table_2 AS (
+  SELECT
+    artist_id,
+    _expr_0 AS new_album_count,
+    _expr_0
+  FROM
+    table_4
+),
+table_1 AS (
+  SELECT
+    artist_id,
+    name as artist_name
+  FROM
+    artists
+),
+table_3 AS (
+  SELECT
+    table_2.artist_id,
+    table_2.new_album_count,
+    table_1.artist_id AS _expr_1,
+    table_1.artist_name,
+    table_2._expr_0
+  FROM
+    table_2
+    LEFT OUTER JOIN table_1 ON table_2.artist_id = table_1.artist_id
+)
+SELECT
+  artist_id,
+  new_album_count,
+  _expr_1,
+  artist_name
+FROM
+  table_3
+ORDER BY
+  artist_id,
+  new_album_count
+`,
+		},
 	}
 
 	for _, tc := range cases {

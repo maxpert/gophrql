@@ -30,7 +30,11 @@ func (p *Parser) parseQuery() (*ast.Query, error) {
 		p.skipNewlines()
 	}
 
-	if !p.matchIdent("from") {
+	if p.peekIs(IDENT) && p.peek().Lit == "from" {
+		p.next()
+	} else if p.peekIs(IDENT) && (p.peek().Lit == "from_text" || p.peek().Lit == "s") {
+		// handled in parseSource
+	} else {
 		return nil, fmt.Errorf("query must start with 'from'")
 	}
 	source, err := p.parseSource()
@@ -90,6 +94,13 @@ func (p *Parser) parseQuery() (*ast.Query, error) {
 					return nil, err
 				}
 				steps = append(steps, step)
+			case "remove":
+				p.next()
+				step, err := p.parseRemove()
+				if err != nil {
+					return nil, err
+				}
+				steps = append(steps, step)
 			case "group":
 				p.next()
 				step, err := p.parseGroup()
@@ -97,6 +108,16 @@ func (p *Parser) parseQuery() (*ast.Query, error) {
 					return nil, err
 				}
 				steps = append(steps, step)
+			case "join":
+				p.next()
+				step, err := p.parseJoin()
+				if err != nil {
+					return nil, err
+				}
+				steps = append(steps, step)
+			case "distinct":
+				p.next()
+				steps = append(steps, &ast.DistinctStep{})
 			case "sort":
 				p.next()
 				step, err := p.parseSort()
@@ -158,6 +179,33 @@ func (p *Parser) parseSource() (ast.Source, error) {
 	}
 
 	tok := p.next()
+	if tok.Typ == IDENT && strings.HasPrefix(tok.Lit, "from_text") {
+		// from_text format:json '...'
+		if !p.peekIs(IDENT) {
+			return ast.Source{}, fmt.Errorf("from_text expects format")
+		}
+		format := p.next().Lit
+		if !strings.Contains(strings.ToLower(format), "json") {
+			return ast.Source{}, fmt.Errorf("from_text only supports json in this stub")
+		}
+		if !p.peekIs(STRING) {
+			return ast.Source{}, fmt.Errorf("from_text expects string literal")
+		}
+		raw := p.next().Lit
+		rows, err := parseJSONTable(raw)
+		if err != nil {
+			return ast.Source{}, err
+		}
+		return ast.Source{Rows: rows}, nil
+	}
+	if tok.Typ == IDENT && tok.Lit == "s" && p.peekIs(STRING) {
+		sql := p.next().Lit
+		return ast.Source{Table: sql}, nil
+	}
+	if tok.Typ == IDENT && strings.HasPrefix(tok.Lit, "s\"") {
+		inner := strings.Trim(tok.Lit, "s\"")
+		return ast.Source{Table: "SELECT " + strings.TrimPrefix(inner, "SELECT ")}, nil
+	}
 	if tok.Typ != IDENT {
 		return ast.Source{}, fmt.Errorf("expected source after from, got %v", tok)
 	}
@@ -325,11 +373,22 @@ func (p *Parser) parseAggregate() (ast.Step, error) {
 			p.next()
 			break
 		}
-		item, err := p.parseAggregateItem()
-		if err != nil {
-			return nil, err
+		if p.peekIs(IDENT) && p.peekN(1).Typ == EQUAL {
+			name := p.next().Lit
+			p.next()
+			item, err := p.parseAggregateItem()
+			if err != nil {
+				return nil, err
+			}
+			item.As = name
+			items = append(items, item)
+		} else {
+			item, err := p.parseAggregateItem()
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, item)
 		}
-		items = append(items, item)
 		if p.peekIs(COMMA) {
 			p.next()
 		}
@@ -348,9 +407,6 @@ func (p *Parser) parseAggregateItem() (ast.AggregateItem, error) {
 	if !ok {
 		return ast.AggregateItem{}, fmt.Errorf("aggregate item must be a function call")
 	}
-	if len(call.Args) != 1 {
-		return ast.AggregateItem{}, fmt.Errorf("aggregate functions require exactly one argument")
-	}
 	fnName := exprToIdent(call.Func)
 	alias := ""
 	if p.peekIs(IDENT) && p.peek().Lit == "as" {
@@ -360,7 +416,11 @@ func (p *Parser) parseAggregateItem() (ast.AggregateItem, error) {
 		}
 		alias = p.next().Lit
 	}
-	return ast.AggregateItem{Func: fnName, Arg: call.Args[0], As: alias}, nil
+	arg := ast.Expr(nil)
+	if len(call.Args) > 0 {
+		arg = call.Args[0]
+	}
+	return ast.AggregateItem{Func: fnName, Arg: arg, As: alias}, nil
 }
 
 func (p *Parser) parseTake() (ast.Step, error) {
@@ -414,20 +474,61 @@ func (p *Parser) parseAppend() (ast.Step, error) {
 	return &ast.AppendStep{Query: subQuery}, nil
 }
 
+func (p *Parser) parseRemove() (ast.Step, error) {
+	p.skipNewlines()
+	if !p.peekIs(LPAREN) {
+		return nil, fmt.Errorf("remove expects '('")
+	}
+	p.next()
+	subTokens := p.collectUntilMatching(RPAREN)
+	subParser := &Parser{tokens: subTokens}
+	subQuery, err := subParser.parseQuery()
+	if err != nil {
+		return nil, err
+	}
+	return &ast.RemoveStep{Query: subQuery}, nil
+}
+
 func (p *Parser) parseGroup() (ast.Step, error) {
 	p.skipNewlines()
-	if !p.peekIs(IDENT) {
-		return nil, fmt.Errorf("group expects identifier key")
+	var keyExpr ast.Expr
+	if p.peekIs(LBRACE) {
+		p.next()
+		var exprs []ast.Expr
+		for {
+			p.skipNewlines()
+			if p.peekIs(RBRACE) {
+				p.next()
+				break
+			}
+			e, err := p.parseExpr(0)
+			if err != nil {
+				return nil, err
+			}
+			exprs = append(exprs, e)
+			if p.peekIs(COMMA) {
+				p.next()
+			}
+		}
+		if len(exprs) == 1 {
+			keyExpr = exprs[0]
+		} else {
+			keyExpr = &ast.Tuple{Exprs: exprs}
+		}
+	} else {
+		if !p.peekIs(IDENT) {
+			return nil, fmt.Errorf("group expects identifier key")
+		}
+		keyTok := p.next()
+		if strings.HasSuffix(keyTok.Lit, ".") && p.peekIs(STAR) {
+			keyTok.Lit = strings.TrimSuffix(keyTok.Lit, ".")
+			p.next()
+		} else if p.peekIs(DOT) && p.peekN(1).Typ == STAR {
+			p.next()
+			p.next()
+		}
+		keyExpr = &ast.Ident{Parts: strings.Split(keyTok.Lit, ".")}
 	}
-	keyTok := p.next()
-	if strings.HasSuffix(keyTok.Lit, ".") && p.peekIs(STAR) {
-		keyTok.Lit = strings.TrimSuffix(keyTok.Lit, ".")
-		p.next()
-	} else if p.peekIs(DOT) && p.peekN(1).Typ == STAR {
-		p.next()
-		p.next()
-	}
-	keyExpr := &ast.Ident{Parts: strings.Split(keyTok.Lit, ".")}
 	p.skipNewlines()
 	if !p.peekIs(LPAREN) {
 		return nil, fmt.Errorf("group expects '(' block")
@@ -542,11 +643,15 @@ func (p *Parser) parseSort() (ast.Step, error) {
 }
 
 func (p *Parser) parseSortItem() (ast.SortItem, error) {
+	desc := false
+	if p.peekIs(MINUS) {
+		p.next()
+		desc = true
+	}
 	expr, err := p.parseExpr(0)
 	if err != nil {
 		return ast.SortItem{}, err
 	}
-	desc := false
 	if p.peekIs(IDENT) && p.peek().Lit == "desc" {
 		p.next()
 		desc = true
@@ -779,4 +884,35 @@ func appendCallArg(fn ast.Expr, arg ast.Expr) ast.Expr {
 		return &ast.Call{Func: call.Func, Args: append(call.Args, arg)}
 	}
 	return &ast.Call{Func: fn, Args: []ast.Expr{arg}}
+}
+
+func (p *Parser) parseJoin() (ast.Step, error) {
+	p.skipNewlines()
+	side := "left"
+	if p.peekIs(IDENT) && strings.Contains(p.peek().Lit, "side:") {
+		side = strings.SplitN(p.next().Lit, ":", 2)[1]
+	}
+	p.skipNewlines()
+	if !p.peekIs(LPAREN) {
+		return nil, fmt.Errorf("join expects '(' source")
+	}
+	p.next()
+	subTokens := p.collectUntilMatching(RPAREN)
+	subParser := &Parser{tokens: subTokens}
+	subQuery, err := subParser.parseQuery()
+	if err != nil {
+		return nil, err
+	}
+	p.skipNewlines()
+	if !p.peekIs(LPAREN) {
+		return nil, fmt.Errorf("join expects '(' condition")
+	}
+	p.next()
+	condTokens := p.collectUntilMatching(RPAREN)
+	condParser := &Parser{tokens: condTokens}
+	cond, err := condParser.parseExpr(0)
+	if err != nil {
+		return nil, err
+	}
+	return &ast.JoinStep{Side: side, Query: subQuery, On: cond}, nil
 }

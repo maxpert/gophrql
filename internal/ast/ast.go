@@ -60,6 +60,15 @@ type (
 	AppendStep struct {
 		Query *Query
 	}
+	RemoveStep struct {
+		Query *Query
+	}
+	JoinStep struct {
+		Side  string
+		Query *Query
+		On    Expr
+	}
+	DistinctStep struct{}
 	GroupStep struct {
 		Key   Expr
 		Steps []Step
@@ -79,8 +88,11 @@ func (*SelectStep) isStep()    {}
 func (*AggregateStep) isStep() {}
 func (*TakeStep) isStep()      {}
 func (*AppendStep) isStep()    {}
+func (*RemoveStep) isStep()    {}
+func (*JoinStep) isStep()      {}
 func (*GroupStep) isStep()     {}
 func (*SortStep) isStep()      {}
+func (*DistinctStep) isStep()  {}
 
 // Expr is an expression node.
 type Expr interface {
@@ -111,6 +123,9 @@ type (
 		Func  Expr
 		Args  []Expr
 	}
+	Tuple struct {
+		Exprs []Expr
+	}
 )
 
 func (*Ident) isExpr()     {}
@@ -119,3 +134,4 @@ func (*StringLit) isExpr() {}
 func (*Binary) isExpr()    {}
 func (*Call) isExpr()      {}
 func (*Pipe) isExpr()      {}
+func (*Tuple) isExpr()     {}
