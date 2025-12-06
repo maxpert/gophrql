@@ -19,27 +19,27 @@ func main() {
         take 10
     `
 
-	// Parse PRQL to AST
+	// Convert PRQL to an AST
 	query, err := gophrql.Parse(prql)
 	if err != nil {
 		panic(err)
 	}
 
 	// Convert AST to MongoDB aggregation pipeline string
-	mongo := ConvertToMongo(query)
+	mongo := convertToMongo(query)
 	fmt.Println(mongo)
 	// Expected output (formatted for readability):
 	// db.users.aggregate([
 	//   { $match: { age: { $gt: 21 }, country: "US" } },
-	//   { $addFields: { full_name: { $concat: ["$first_name", " ", "$last_name"] } } },
-	//   { $project: { full_name: 1, email: 1, age: 1, _id: 0 } },
+	//   { $project: { name: 1, email: 1, age: 1, _id: 0 } },
 	//   { $sort: { age: -1 } },
 	//   { $limit: 10 }
 	// ])
+
 }
 
 // ConvertToMongo builds a MongoDB aggregation pipeline from a PRQL AST query.
-func ConvertToMongo(q *ast.Query) string {
+func convertToMongo(q *ast.Query) string {
 	var stages []string
 
 	// $match stage – collect all filter expressions
@@ -53,44 +53,6 @@ func ConvertToMongo(q *ast.Query) string {
 		// combine filters with logical AND
 		combined := strings.Join(matchFilters, ", ")
 		stages = append(stages, fmt.Sprintf("{ $match: { %s } }", combined))
-	}
-
-	// $addFields stage – handle derive steps (simple f-strings only)
-	for _, step := range q.Steps {
-		if d, ok := step.(*ast.DeriveStep); ok {
-			fields := []string{}
-			for _, assign := range d.Assignments {
-				// Very basic handling: only support f"{a} {b}" pattern
-				if strings.HasPrefix(assign.Expr.String(), "f\"") {
-					// Extract variable names inside braces
-					// This is a naive implementation for demonstration
-					expr := assign.Expr.(*ast.Call)
-					// Assume the call is a formatted string; we just map to $concat
-					// Example: f"{first_name} {last_name}" -> [$first_name, " ", $last_name]
-					// We'll split on spaces and braces
-					raw := assign.Expr.(*ast.Call).Args[0].(*ast.StringLit).Value
-					// Remove surrounding quotes if any
-					raw = strings.Trim(raw, "\"")
-					parts := []string{}
-					for _, part := range strings.Split(raw, " ") {
-						if strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}") {
-							varName := strings.Trim(part, "{}")
-							parts = append(parts, fmt.Sprintf("\"$%s\"", varName))
-						} else if part != "" {
-							parts = append(parts, fmt.Sprintf("\"%s\"", part))
-						}
-					}
-					concat := fmt.Sprintf("{ $concat: [%s] }", strings.Join(parts, ", "))
-					fields = append(fields, fmt.Sprintf("%s: %s", assign.Name, concat))
-				} else {
-					// Fallback: just use the expression as is (not fully supported)
-					fields = append(fields, fmt.Sprintf("%s: %s", assign.Name, exprToMongo(assign.Expr)))
-				}
-			}
-			if len(fields) > 0 {
-				stages = append(stages, fmt.Sprintf("{ $addFields: { %s } }", strings.Join(fields, ", ")))
-			}
-		}
 	}
 
 	// $project stage – handle select steps
