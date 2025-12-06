@@ -203,6 +203,79 @@ ORDER BY
 `,
 		},
 		{
+			name: "sort_alias_filter_join",
+			prql: `
+from albums
+select { AA=album_id, artist_id }
+sort AA
+filter AA >= 25
+join artists (==artist_id)
+`,
+			wantSQL: `
+WITH table_1 AS (
+  SELECT
+    album_id AS "AA",
+    artist_id
+  FROM
+    albums
+),
+table_0 AS (
+  SELECT
+    "AA",
+    artist_id
+  FROM
+    table_1
+  WHERE
+    "AA" >= 25
+)
+SELECT
+  table_0."AA",
+  table_0.artist_id,
+  artists.*
+FROM
+  table_0
+  INNER JOIN artists ON table_0.artist_id = artists.artist_id
+ORDER BY
+  table_0."AA"
+`,
+		},
+		{
+			name: "constants_only",
+			prql: `
+from genres
+take 10
+filter true
+take 20
+filter true
+select d = 10
+`,
+			wantSQL: `
+WITH table_1 AS (
+  SELECT
+    NULL
+  FROM
+    genres
+  LIMIT
+    10
+), table_0 AS (
+  SELECT
+    NULL
+  FROM
+    table_1
+  WHERE
+    true
+  LIMIT
+    20
+)
+SELECT
+  10 AS d
+FROM
+  table_0
+WHERE
+  true
+`,
+		},
+		{
 			name: "append_select_union",
 			prql: `
 from invoices
