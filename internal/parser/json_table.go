@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/maxpert/gophrql/internal/ast"
+	"github.com/maxpert/gophrql/ast"
 )
 
 func parseJSONTable(raw string) ([]ast.InlineRow, error) {

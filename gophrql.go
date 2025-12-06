@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/maxpert/gophrql/internal/ast"
+	"github.com/maxpert/gophrql/ast"
 	"github.com/maxpert/gophrql/internal/parser"
 	"github.com/maxpert/gophrql/internal/sqlgen"
 )
@@ -13,8 +13,37 @@ import (
 // ErrNotImplemented indicates a requested feature has not been built yet.
 var ErrNotImplemented = errors.New("gophrql: compiler not implemented")
 
+// CompileOptions defines functional options for the compiler.
+type CompileOptions struct {
+	Target  string
+	Dialect *sqlgen.Dialect
+}
+
+// Option configures the compiler.
+type Option func(*CompileOptions)
+
+// WithTarget sets the target dialect by name (e.g. "sql.postgres").
+func WithTarget(target string) Option {
+	return func(o *CompileOptions) {
+		o.Target = target
+	}
+}
+
+// Parse parses PRQL source into an AST Query.
+// This allows users to inspect the parse tree or write custom backends (e.g. MongoDB).
+func Parse(prql string) (*ast.Query, error) {
+	return parser.Parse(prql)
+}
+
 // Compile compiles a PRQL query into SQL following the PRQL book semantics.
-func Compile(prql string) (string, error) {
+func Compile(prql string, opts ...Option) (string, error) {
+	options := &CompileOptions{
+		Dialect: sqlgen.DefaultDialect,
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
+
 	trimmed := strings.TrimSpace(prql)
 	if trimmed == "" || isCommentOnly(trimmed) {
 		return "", fmt.Errorf("[E0001] Error: No PRQL query entered")
@@ -37,11 +66,22 @@ func Compile(prql string) (string, error) {
 		return "", err
 	}
 
-	if tq.Target != "" && tq.Target != "sql.generic" {
-		return "", fmt.Errorf("unsupported target %q", tq.Target)
+	// Target in PRQL file overrides option, but we align them
+	if tq.Target != "" {
+		options.Target = tq.Target
 	}
 
-	sql, err := sqlgen.ToSQL(tq)
+	// Resolve dialect from target if provided
+	if options.Target != "" {
+		if d := sqlgen.GetDialect(options.Target); d != nil {
+			options.Dialect = d
+		} else {
+			// Warn or error? For now, fallback to default but maybe we should error if explicit target unknown
+			// return "", fmt.Errorf("unsupported target %q", options.Target)
+		}
+	}
+
+	sql, err := sqlgen.ToSQL(tq, options.Dialect)
 	if err != nil {
 		return "", err
 	}

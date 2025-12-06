@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/maxpert/gophrql/internal/ast"
+	"github.com/maxpert/gophrql/ast"
 )
 
 // Parse converts PRQL source into an AST.Query.
