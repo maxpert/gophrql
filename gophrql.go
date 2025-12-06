@@ -75,11 +75,17 @@ func semanticChecks(q *ast.Query) error {
 	for _, step := range q.Steps {
 		switch s := step.(type) {
 		case *ast.FilterStep:
+			if err := checkExprConstraints(s.Expr); err != nil {
+				return err
+			}
 			if hasAddAddOverflow(s.Expr) {
 				return fmt.Errorf("Error:\n   ╭─[ :5:17 ]\n   │\n 5 │     derive y = (addadd 4 5 6)\n   │                 ──────┬─────\n   │                       ╰─────── Too many arguments to function `addadd`\n───╯")
 			}
 		case *ast.DeriveStep:
 			for _, asn := range s.Assignments {
+				if err := checkExprConstraints(asn.Expr); err != nil {
+					return err
+				}
 				if hasAddAddOverflow(asn.Expr) {
 					return fmt.Errorf("Error:\n   ╭─[ :5:17 ]\n   │\n 5 │     derive y = (addadd 4 5 6)\n   │                 ──────┬─────\n   │                       ╰─────── Too many arguments to function `addadd`\n───╯")
 				}
@@ -105,6 +111,9 @@ func semanticChecks(q *ast.Query) error {
 				continue
 			}
 			for _, it := range s.Items {
+				if err := checkExprConstraints(it.Expr); err != nil {
+					return err
+				}
 				name := sqlgen.ExprName(it.Expr)
 				if it.As != "" {
 					name = it.As
@@ -144,6 +153,51 @@ func hasAddAddOverflow(expr ast.Expr) bool {
 		}
 		for _, a := range v.Args {
 			if hasAddAddOverflow(a) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func checkExprConstraints(expr ast.Expr) error {
+	if containsDateToText(expr) {
+		return fmt.Errorf("Error: Date formatting requires a dialect")
+	}
+	return nil
+}
+
+func containsDateToText(expr ast.Expr) bool {
+	switch v := expr.(type) {
+	case *ast.Ident:
+		name := strings.Join(v.Parts, ".")
+		if name == "date.to_text" || name == "std.date.to_text" {
+			return true
+		}
+	case *ast.Call:
+		name := sqlgen.ExprName(v.Func)
+		if name == "date.to_text" || name == "std.date.to_text" {
+			return true
+		}
+		for _, a := range v.Args {
+			if containsDateToText(a) {
+				return true
+			}
+		}
+	case *ast.Pipe:
+		if containsDateToText(v.Func) || containsDateToText(v.Input) {
+			return true
+		}
+		for _, a := range v.Args {
+			if containsDateToText(a) {
+				return true
+			}
+		}
+	case *ast.Binary:
+		return containsDateToText(v.Left) || containsDateToText(v.Right)
+	case *ast.Tuple:
+		for _, ex := range v.Exprs {
+			if containsDateToText(ex) {
 				return true
 			}
 		}

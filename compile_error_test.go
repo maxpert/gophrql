@@ -71,9 +71,17 @@ take 1.8
 			name: "comment_then_empty",
 			prql: `
 # header
-  
+ 
 `,
 			wantContains: "No PRQL query entered",
+		},
+		{
+			name: "date_to_text_requires_dialect",
+			prql: `
+from invoices
+derive { d_str = (invoice_date | date.to_text "%Y/%m/%d") }
+`,
+			wantContains: "Date formatting requires a dialect",
 		},
 	}
 
