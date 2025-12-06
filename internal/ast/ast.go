@@ -10,6 +10,16 @@ type Query struct {
 // Source represents a relation source.
 type Source struct {
 	Table string
+	Rows  []InlineRow // inline rows when Table is empty
+}
+
+type InlineRow struct {
+	Fields []Field
+}
+
+type Field struct {
+	Name string
+	Expr Expr
 }
 
 // Step is a pipeline stage.

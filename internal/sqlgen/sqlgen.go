@@ -34,6 +34,7 @@ func ToSQL(q *ast.Query) (string, error) {
 
 func compileLinear(q *ast.Query) (string, error) {
 	builder := newBuilder(q.From.Table)
+	builder.inlineRows = q.From.Rows
 	for _, step := range q.Steps {
 		switch s := step.(type) {
 		case *ast.FilterStep:
@@ -52,7 +53,9 @@ func compileLinear(q *ast.Query) (string, error) {
 			builder.aliases = map[string]ast.Expr{}
 			for _, it := range s.Items {
 				if it.As != "" {
-					builder.selects = append(builder.selects, fmt.Sprintf("%s AS %s", builder.exprSQL(it.Expr), it.As))
+					expr := builder.exprSQL(it.Expr)
+					builder.selects = append(builder.selects, fmt.Sprintf("%s AS %s", expr, it.As))
+					builder.aliases[it.As] = it.Expr
 				} else {
 					builder.selects = append(builder.selects, builder.exprSQL(it.Expr))
 				}
@@ -290,6 +293,7 @@ func compileDistinct(q *ast.Query, gs *ast.GroupStep, groupIndex int) (string, e
 // builder handles simple linear pipelines.
 type builder struct {
 	from       string
+	inlineRows []ast.InlineRow
 	filters    []string
 	derives    []string
 	selects    []string
@@ -306,6 +310,12 @@ func newBuilder(from string) *builder {
 
 func (b *builder) build() string {
 	var sb strings.Builder
+	fromName := b.from
+	if len(b.inlineRows) > 0 {
+		fromName = "table_0"
+		sb.WriteString(buildInlineCTE(b.inlineRows))
+		sb.WriteString("\n")
+	}
 	sb.WriteString("SELECT\n")
 	if len(b.aggregates) > 0 {
 		sb.WriteString("  " + strings.Join(b.aggregates, ",\n  "))
@@ -317,7 +327,7 @@ func (b *builder) build() string {
 		sb.WriteString("  *")
 	}
 	sb.WriteString("\nFROM\n")
-	sb.WriteString("  " + b.from + "\n")
+	sb.WriteString("  " + fromName + "\n")
 	if len(b.filters) > 0 {
 		sb.WriteString("WHERE\n  " + strings.Join(b.filters, " AND ") + "\n")
 	}
@@ -338,6 +348,30 @@ func (b *builder) build() string {
 
 func (b *builder) exprSQL(e ast.Expr) string {
 	return exprSQLWithAliases(e, b.aliases)
+}
+
+func buildInlineCTE(rows []ast.InlineRow) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("WITH table_0 AS (\n")
+	for i, row := range rows {
+		if i > 0 {
+			sb.WriteString("  UNION\n  ALL\n")
+		}
+		sb.WriteString("  SELECT\n")
+		for j, f := range row.Fields {
+			sb.WriteString("    " + exprSQL(f.Expr) + " AS " + f.Name)
+			if j < len(row.Fields)-1 {
+				sb.WriteString(",\n")
+			} else {
+				sb.WriteString("\n")
+			}
+		}
+	}
+	sb.WriteString(")")
+	return sb.String()
 }
 
 func exprSQL(e ast.Expr) string {
@@ -367,6 +401,11 @@ func exprSQLWithAliases(e ast.Expr, aliases map[string]ast.Expr) string {
 	case *ast.Binary:
 		if v.Op == "**" {
 			return fmt.Sprintf("POW(%s, %s)", exprSQLWithAliases(v.Left, aliases), exprSQLWithAliases(v.Right, aliases))
+		}
+		if v.Op == "//" {
+			left := exprSQLWithAliases(v.Left, aliases)
+			right := exprSQLWithAliases(v.Right, aliases)
+			return fmt.Sprintf("FLOOR(ABS(%s / %s)) * SIGN(%s) * SIGN(%s)", left, right, left, right)
 		}
 		if v.Op == "~=" {
 			return fmt.Sprintf("REGEXP(%s, %s)", exprSQLWithAliases(v.Left, aliases), exprSQLWithAliases(v.Right, aliases))
@@ -427,6 +466,11 @@ func exprSQLWithAliases(e ast.Expr, aliases map[string]ast.Expr) string {
 			return fmt.Sprintf("TAN(%s)", exprSQLWithAliases(v.Args[0], aliases))
 		case "math.atan":
 			return fmt.Sprintf("ATAN(%s)", exprSQLWithAliases(v.Args[0], aliases))
+		case "math.round":
+			if len(v.Args) == 2 {
+				return fmt.Sprintf("ROUND(%s, %s)", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(v.Args[1], aliases))
+			}
+			return fmt.Sprintf("ROUND(%s)", exprSQLWithAliases(v.Args[0], aliases))
 		case "math.pow":
 			return fmt.Sprintf("POW(%s, %s)", exprSQLWithAliases(v.Args[0], aliases), exprSQLWithAliases(v.Args[1], aliases))
 		case "text.lower":

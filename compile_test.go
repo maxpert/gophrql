@@ -277,6 +277,109 @@ ORDER BY
   album_id, genre_id
 `,
 		},
+		{
+			name: "arithmetic_div_mod",
+			prql: `
+from [
+    { id = 1, x_int =  13, x_float =  13.0, k_int =  5, k_float =  5.0 },
+    { id = 2, x_int = -13, x_float = -13.0, k_int =  5, k_float =  5.0 },
+    { id = 3, x_int =  13, x_float =  13.0, k_int = -5, k_float = -5.0 },
+    { id = 4, x_int = -13, x_float = -13.0, k_int = -5, k_float = -5.0 },
+]
+select {
+    id,
+
+    x_int / k_int,
+    x_int / k_float,
+    x_float / k_int,
+    x_float / k_float,
+
+    q_ii = x_int // k_int,
+    q_if = x_int // k_float,
+    q_fi = x_float // k_int,
+    q_ff = x_float // k_float,
+
+    r_ii = x_int % k_int,
+    r_if = x_int % k_float,
+    r_fi = x_float % k_int,
+    r_ff = x_float % k_float,
+
+    (q_ii * k_int + r_ii | math.round 0),
+    (q_if * k_float + r_if | math.round 0),
+    (q_fi * k_int + r_fi | math.round 0),
+    (q_ff * k_float + r_ff | math.round 0),
+}
+sort id
+`,
+			wantSQL: `
+WITH table_0 AS (
+  SELECT
+    1 AS id,
+    13 AS x_int,
+    13.0 AS x_float,
+    5 AS k_int,
+    5.0 AS k_float
+  UNION
+  ALL
+  SELECT
+    2 AS id,
+    -13 AS x_int,
+    -13.0 AS x_float,
+    5 AS k_int,
+    5.0 AS k_float
+  UNION
+  ALL
+  SELECT
+    3 AS id,
+    13 AS x_int,
+    13.0 AS x_float,
+    -5 AS k_int,
+    -5.0 AS k_float
+  UNION
+  ALL
+  SELECT
+    4 AS id,
+    -13 AS x_int,
+    -13.0 AS x_float,
+    -5 AS k_int,
+    -5.0 AS k_float
+)
+SELECT
+  id,
+  x_int / k_int,
+  x_int / k_float,
+  x_float / k_int,
+  x_float / k_float,
+  FLOOR(ABS(x_int / k_int)) * SIGN(x_int) * SIGN(k_int) AS q_ii,
+  FLOOR(ABS(x_int / k_float)) * SIGN(x_int) * SIGN(k_float) AS q_if,
+  FLOOR(ABS(x_float / k_int)) * SIGN(x_float) * SIGN(k_int) AS q_fi,
+  FLOOR(ABS(x_float / k_float)) * SIGN(x_float) * SIGN(k_float) AS q_ff,
+  x_int % k_int AS r_ii,
+  x_int % k_float AS r_if,
+  x_float % k_int AS r_fi,
+  x_float % k_float AS r_ff,
+  ROUND(
+    FLOOR(ABS(x_int / k_int)) * SIGN(x_int) * SIGN(k_int) * k_int + x_int % k_int,
+    0
+  ),
+  ROUND(
+    FLOOR(ABS(x_int / k_float)) * SIGN(x_int) * SIGN(k_float) * k_float + x_int % k_float,
+    0
+  ),
+  ROUND(
+    FLOOR(ABS(x_float / k_int)) * SIGN(x_float) * SIGN(k_int) * k_int + x_float % k_int,
+    0
+  ),
+  ROUND(
+    FLOOR(ABS(x_float / k_float)) * SIGN(x_float) * SIGN(k_float) * k_float + x_float % k_float,
+    0
+  )
+FROM
+  table_0
+ORDER BY
+  id
+`,
+		},
 	}
 
 	for _, tc := range cases {
@@ -294,5 +397,5 @@ ORDER BY
 }
 
 func normalize(s string) string {
-	return strings.TrimSpace(s)
+	return strings.Join(strings.Fields(strings.TrimSpace(s)), "")
 }

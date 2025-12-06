@@ -16,29 +16,32 @@ const (
 	STRING            = "STRING"
 	NEWLINE           = "NEWLINE"
 
-	LPAREN  = "("
-	RPAREN  = ")"
-	LBRACE  = "{"
-	RBRACE  = "}"
-	COMMA   = ","
-	EQUAL   = "="
-	DOT     = "."
-	PIPE    = "|"
-	STAR    = "*"
-	PLUS    = "+"
-	MINUS   = "-"
-	SLASH   = "/"
-	CARET   = "^"
-	POW     = "**"
-	REGEXEQ = "~="
-	RANGE   = ".."
-	EQ      = "=="
-	NEQ     = "!="
-	PERCENT = "%"
-	LT      = "<"
-	GT      = ">"
-	LTE     = "<="
-	GTE     = ">="
+	LPAREN   = "("
+	RPAREN   = ")"
+	LBRACE   = "{"
+	RBRACE   = "}"
+	LBRACKET = "["
+	RBRACKET = "]"
+	COMMA    = ","
+	EQUAL    = "="
+	DOT      = "."
+	PIPE     = "|"
+	STAR     = "*"
+	PLUS     = "+"
+	MINUS    = "-"
+	SLASH    = "/"
+	FLOORDIV = "//"
+	CARET    = "^"
+	POW      = "**"
+	REGEXEQ  = "~="
+	RANGE    = ".."
+	EQ       = "=="
+	NEQ      = "!="
+	PERCENT  = "%"
+	LT       = "<"
+	GT       = ">"
+	LTE      = "<="
+	GTE      = ">="
 )
 
 type Token struct {
@@ -148,6 +151,11 @@ func Lex(input string) ([]Token, error) {
 			i += 2
 			continue
 		}
+		if strings.HasPrefix(input[i:], "//") {
+			tokens = append(tokens, Token{Typ: FLOORDIV, Lit: "//"})
+			i += 2
+			continue
+		}
 		if strings.HasPrefix(input[i:], "~=") {
 			tokens = append(tokens, Token{Typ: REGEXEQ, Lit: "~="})
 			i += 2
@@ -189,6 +197,10 @@ func Lex(input string) ([]Token, error) {
 			tokens = append(tokens, Token{Typ: LBRACE, Lit: "{"})
 		case '}':
 			tokens = append(tokens, Token{Typ: RBRACE, Lit: "}"})
+		case '[':
+			tokens = append(tokens, Token{Typ: LBRACKET, Lit: "["})
+		case ']':
+			tokens = append(tokens, Token{Typ: RBRACKET, Lit: "]"})
 		case ',':
 			tokens = append(tokens, Token{Typ: COMMA, Lit: ","})
 		case '=':

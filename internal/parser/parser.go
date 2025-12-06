@@ -122,6 +122,41 @@ func (p *Parser) parseQuery() (*ast.Query, error) {
 
 func (p *Parser) parseSource() (ast.Source, error) {
 	p.skipNewlines()
+	if p.peekIs(LBRACKET) {
+		p.next()
+		var rows []ast.InlineRow
+		for {
+			p.skipNewlines()
+			if p.peekIs(RBRACE) {
+				p.next()
+				continue
+			}
+			if p.peekIs(RBRACKET) {
+				p.next()
+				break
+			}
+			if !p.peekIs(LBRACE) {
+				return ast.Source{}, fmt.Errorf("expected { in inline rows")
+			}
+			p.next()
+			rec, err := p.parseRecord()
+			if err != nil {
+				return ast.Source{}, err
+			}
+			rows = append(rows, rec)
+			p.skipNewlines()
+			if p.peekIs(COMMA) {
+				p.next()
+			}
+			p.skipNewlines()
+			if p.peekIs(RBRACKET) {
+				p.next()
+				break
+			}
+		}
+		return ast.Source{Rows: rows}, nil
+	}
+
 	tok := p.next()
 	if tok.Typ != IDENT {
 		return ast.Source{}, fmt.Errorf("expected source after from, got %v", tok)
@@ -185,6 +220,35 @@ func (p *Parser) parseAssignment() (ast.Assignment, error) {
 		return ast.Assignment{}, err
 	}
 	return ast.Assignment{Name: name, Expr: expr}, nil
+}
+
+func (p *Parser) parseRecord() (ast.InlineRow, error) {
+	var fields []ast.Field
+	for {
+		p.skipNewlines()
+		if p.peekIs(RBRACE) {
+			p.next()
+			break
+		}
+		if !p.peekIs(IDENT) {
+			return ast.InlineRow{}, fmt.Errorf("expected field name in record")
+		}
+		key := p.next().Lit
+		if !p.peekIs(EQUAL) {
+			return ast.InlineRow{}, fmt.Errorf("expected = after field name")
+		}
+		p.next()
+		val, err := p.parseExpr(0)
+		if err != nil {
+			return ast.InlineRow{}, err
+		}
+		fields = append(fields, ast.Field{Name: key, Expr: val})
+		p.skipNewlines()
+		if p.peekIs(COMMA) {
+			p.next()
+		}
+	}
+	return ast.InlineRow{Fields: fields}, nil
 }
 
 func (p *Parser) parseSelect() (ast.Step, error) {
@@ -492,20 +556,21 @@ func (p *Parser) parseSortItem() (ast.SortItem, error) {
 
 // Expression parsing (Pratt-style with limited operators).
 var precedences = map[TokenType]int{
-	EQ:      2,
-	REGEXEQ: 2,
-	NEQ:     2,
-	RANGE:   2,
-	LT:      3,
-	GT:      3,
-	LTE:     3,
-	GTE:     3,
-	PLUS:    4,
-	MINUS:   4,
-	STAR:    5,
-	SLASH:   5,
-	PERCENT: 5,
-	POW:     6,
+	EQ:       2,
+	REGEXEQ:  2,
+	NEQ:      2,
+	RANGE:    2,
+	LT:       3,
+	GT:       3,
+	LTE:      3,
+	GTE:      3,
+	PLUS:     4,
+	MINUS:    4,
+	STAR:     5,
+	SLASH:    5,
+	FLOORDIV: 5,
+	PERCENT:  5,
+	POW:      6,
 }
 
 func (p *Parser) parseExpr(precedence int) (ast.Expr, error) {
@@ -522,6 +587,9 @@ func (p *Parser) parseExpr(precedence int) (ast.Expr, error) {
 
 		// Pipe operator has low precedence; handle directly.
 		if p.peekIs(PIPE) {
+			if precedence > 1 {
+				break
+			}
 			p.next()
 			fn, err := p.parsePrefix()
 			if err != nil {
@@ -599,6 +667,10 @@ func (p *Parser) parsePrefix() (ast.Expr, error) {
 		p.next()
 		return expr, nil
 	case MINUS:
+		if p.peekIs(NUMBER) {
+			num := p.next().Lit
+			return &ast.Number{Value: "-" + num}, nil
+		}
 		expr, err := p.parseExpr(precedences[MINUS])
 		if err != nil {
 			return nil, err
