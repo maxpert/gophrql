@@ -32,8 +32,10 @@ func TestIntegrationSnapshots(t *testing.T) {
 				t.Fatalf("Failed to parse snapshot %s: %v", snapPath, err)
 			}
 
-			// We only target generic dialect for now (default)
-			// TODO: parse dialect exclusions from PRQL comments if necessary (e.g. # sqlite:skip)
+			// We only target generic dialect for now (default); skip cases that explicitly opt out.
+			if strings.Contains(prql, "# generic:skip") {
+				t.Skip("Upstream query skips the generic dialect")
+			}
 
 			gotSQL, err := gophrql.Compile(prql)
 			if err != nil {
