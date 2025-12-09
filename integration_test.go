@@ -47,6 +47,48 @@ func TestIntegrationSnapshots(t *testing.T) {
 	}
 }
 
+// TestIntegrationCompileSnapshots ensures each query read by `sql.rs` has an upstream SQL snapshot.
+// The PRQL file list under tmp/prql/.../queries comes from `prqlc/tests/integration/sql.rs`, so if
+// every PRQL query there has an `integration__queries__compile__*.snap` file, we know the Go integration
+// tests exercise the same set of cases.
+func TestIntegrationCompileSnapshots(t *testing.T) {
+	queryDir := "tmp/prql/prqlc/prqlc/tests/integration/queries"
+	snapshotsDir := "tmp/prql/prqlc/prqlc/tests/integration/snapshots"
+
+	if _, err := os.Stat(queryDir); os.IsNotExist(err) {
+		t.Skipf("Queries directory not found at %s; skipping integration coverage check", queryDir)
+	}
+
+	queryFiles, err := filepath.Glob(filepath.Join(queryDir, "*.prql"))
+	if err != nil {
+		t.Fatalf("Failed to list queries: %v", err)
+	}
+
+	var missing []string
+	for _, queryPath := range queryFiles {
+		name := strings.TrimSuffix(filepath.Base(queryPath), ".prql")
+		snapshotPath := filepath.Join(snapshotsDir, "integration__queries__compile__"+name+".snap")
+
+		queryContent, err := os.ReadFile(queryPath)
+		if err != nil {
+			t.Fatalf("Failed to read query %s: %v", queryPath, err)
+		}
+		if strings.Contains(string(queryContent), "# generic:skip") {
+			continue
+		}
+
+		if _, err := os.Stat(snapshotPath); os.IsNotExist(err) {
+			missing = append(missing, name)
+		} else if err != nil {
+			t.Fatalf("Failed to stat snapshot %s: %v", snapshotPath, err)
+		}
+	}
+
+	if len(missing) > 0 {
+		t.Fatalf("Missing compile snapshots for queries: %s", strings.Join(missing, ", "))
+	}
+}
+
 func parseSnapshotAndInput(snapPath string) (string, string, error) {
 	f, err := os.Open(snapPath)
 	if err != nil {
