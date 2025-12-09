@@ -15,6 +15,9 @@ func ToSQL(q *ast.Query, dialect *Dialect) (string, error) {
 	if dialect == nil {
 		dialect = DefaultDialect
 	}
+	if isConstantsOnly(q) {
+		return compileConstantsOnly(), nil
+	}
 	q, err := normalizePipelineStages(q)
 	if err != nil {
 		return "", err
@@ -141,10 +144,12 @@ func normalizePipelineStages(q *ast.Query) (*ast.Query, error) {
 				shouldSplit = true
 			}
 			hasLimit = true
-		case *ast.FilterStep, *ast.SortStep, *ast.AggregateStep, *ast.GroupStep, *ast.JoinStep:
+		case *ast.FilterStep, *ast.SortStep, *ast.AggregateStep:
 			if hasLimit {
 				shouldSplit = true
 			}
+		case *ast.GroupStep:
+			hasLimit = false
 		}
 
 		if shouldSplit {
@@ -1078,7 +1083,7 @@ func compileGroupedAggregate(q *ast.Query, gs *ast.GroupStep, groupIndex int, di
 		otherPre = append(otherPre, st)
 	}
 
-	if len(simpleJoins) > 0 && simpleJoinPossible && preStepsSupported(otherPre) && len(post) == 1 && simpleJoinCount == len(simpleJoins) {
+	if len(simpleJoins) > 0 && simpleJoinPossible && preStepsSupported(otherPre) && simpleJoinCount == len(simpleJoins) {
 		return compileGroupedAggregateSimpleJoins(q, gs, otherPre, simpleJoins, post, dialect)
 	}
 
@@ -1115,6 +1120,12 @@ func compileGroupedAggregateWithJoin(q *ast.Query, gs *ast.GroupStep, steps []as
 	}
 
 	aliasMap := map[string]ast.Expr{}
+	for _, g := range groupExprs {
+		name := columnName(g)
+		if name != "" {
+			aliasMap[name] = &ast.Ident{Parts: []string{name}}
+		}
+	}
 	var aggCols []string
 	aggCols = append(aggCols, groupExprs...)
 
@@ -1143,6 +1154,7 @@ func compileGroupedAggregateWithJoin(q *ast.Query, gs *ast.GroupStep, steps []as
 	if hasFilter {
 		aggName = "table_3"
 	}
+	addAliasVariants(aliasMap, aggName)
 	aggCTE := fmt.Sprintf("%s AS (\n  SELECT\n    %s\n  FROM\n    %s\n  GROUP BY\n    %s\n)", aggName, strings.Join(aggCols, ",\n    "), baseName, strings.Join(groupExprs, ",\n    "))
 	appendCTE(&with, aggCTE)
 
@@ -1178,6 +1190,7 @@ func compileGroupedAggregateWithJoin(q *ast.Query, gs *ast.GroupStep, steps []as
 		appendCTE(&with, filterSQL)
 		sourceName = filterName
 	}
+	addAliasVariants(aliasMap, sourceName)
 
 	selectCols := leftCols
 	if filterStep != nil {
@@ -1185,6 +1198,7 @@ func compileGroupedAggregateWithJoin(q *ast.Query, gs *ast.GroupStep, steps []as
 	}
 	leftCTE := fmt.Sprintf("table_2 AS (\n  SELECT\n    %s\n  FROM\n    %s\n)", strings.Join(selectCols, ",\n    "), sourceName)
 	appendCTE(&with, leftCTE)
+	addAliasVariants(aliasMap, "table_2")
 
 	joinName := "table_1"
 	if len(joinStep.Query.From.Rows) > 0 {
@@ -1226,8 +1240,12 @@ func compileGroupedAggregateWithJoin(q *ast.Query, gs *ast.GroupStep, steps []as
 	if strings.ToLower(joinStep.Side) == "inner" {
 		joinType = "INNER JOIN"
 	}
+	aliasMap["this"] = &ast.Ident{Parts: []string{"table_2"}}
+	aliasMap["that"] = &ast.Ident{Parts: []string{joinName}}
 	joinCond := exprSQLWithAliases(joinStep.On, aliasMap, dialect)
 	joinCond = strings.ReplaceAll(joinCond, "table_1.", joinName+".")
+	joinCond = strings.ReplaceAll(joinCond, "this.", "table_2.")
+	joinCond = strings.ReplaceAll(joinCond, "that.", joinName+".")
 	if filterStep != nil {
 		sql := with.String()
 		selectCols := []string{
@@ -1283,6 +1301,30 @@ func compileGroupedAggregateWithJoin(q *ast.Query, gs *ast.GroupStep, steps []as
 		sql += "\nORDER BY\n  " + strings.Join(order, ",\n  ")
 	}
 	return sql, nil
+}
+
+func addAliasVariants(aliasMap map[string]ast.Expr, table string) {
+	if table == "" {
+		return
+	}
+	keys := make([]string, 0, len(aliasMap))
+	for k := range aliasMap {
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		if k == "this" || k == "that" {
+			continue
+		}
+		if !strings.Contains(k, ".") {
+			val := aliasMap[k]
+			if id, ok := val.(*ast.Ident); ok && strings.Join(id.Parts, ".") == k {
+				val = &ast.Ident{Parts: []string{table, k}}
+			}
+			aliasMap[fmt.Sprintf("%s.%s", table, k)] = val
+			aliasMap["this."+k] = val
+		}
+	}
+	aliasMap["this"] = &ast.Ident{Parts: []string{table}}
 }
 
 func compileGroupedAggregateSimple(q *ast.Query, gs *ast.GroupStep, steps []ast.Step, dialect *Dialect) (string, error) {
@@ -1542,7 +1584,13 @@ func simpleJoinClause(baseAlias string, join *ast.JoinStep, idx int, dialect *Di
 		return "", "", fmt.Errorf("empty join source")
 	}
 	joinAlias := extractAlias(source)
-	cond := exprSQL(join.On)
+	aliases := map[string]ast.Expr{
+		"this": &ast.Ident{Parts: []string{baseAlias}},
+		"that": &ast.Ident{Parts: []string{joinAlias}},
+	}
+	cond := exprSQLWithAliases(join.On, aliases, dialect)
+	cond = strings.ReplaceAll(cond, "this.", baseAlias+".")
+	cond = strings.ReplaceAll(cond, "that.", joinAlias+".")
 	cond = strings.ReplaceAll(cond, "table_2.", baseAlias+".")
 	cond = strings.ReplaceAll(cond, "table_1.", joinAlias+".")
 	joinType := "INNER JOIN"
@@ -2251,7 +2299,13 @@ func compileGroupSortTake(q *ast.Query, gs *ast.GroupStep, groupIndex int, diale
 		if strings.ToLower(joinStep.Side) == "inner" {
 			joinType = "INNER JOIN"
 		}
-		on := exprSQLWithAliases(joinStep.On, nil, b.dialect)
+		aliasMap := map[string]ast.Expr{
+			"this": &ast.Ident{Parts: []string{"table_0"}},
+			"that": &ast.Ident{Parts: []string{rightTable}},
+		}
+		on := exprSQLWithAliases(joinStep.On, aliasMap, b.dialect)
+		on = strings.ReplaceAll(on, "this.", "table_0.")
+		on = strings.ReplaceAll(on, "that.", rightTable+".")
 		on = strings.ReplaceAll(on, "table_2.", "table_0.")
 		on = strings.ReplaceAll(on, "table_left.", "table_0.")
 		on = strings.ReplaceAll(on, "table_right.", rightTable+".")
@@ -2265,7 +2319,7 @@ func compileGroupSortTake(q *ast.Query, gs *ast.GroupStep, groupIndex int, diale
 		var selectCols []string
 		if selectStep != nil {
 			for _, it := range selectStep.Items {
-				expr := exprSQLWithAliases(it.Expr, nil, b.dialect)
+				expr := exprSQLWithAliases(it.Expr, aliasMap, b.dialect)
 				name := columnName(expr)
 				prefix := rightTable
 				if projMap[name] {
@@ -2288,7 +2342,7 @@ func compileGroupSortTake(q *ast.Query, gs *ast.GroupStep, groupIndex int, diale
 		if sortStep != nil && len(sortStep.Items) > 0 {
 			var orderParts []string
 			for _, it := range sortStep.Items {
-				expr := exprSQL(it.Expr)
+				expr := exprSQLWithAliases(it.Expr, aliasMap, b.dialect)
 				name := columnName(expr)
 				prefix := rightTable
 				if projMap[name] {
@@ -3249,7 +3303,11 @@ func compileSortAliasInlineSources(q *ast.Query, dialect *Dialect) (string, erro
 	joinName := fmt.Sprintf("table_%d", nextDerived)
 	nextDerived--
 	joinAliases := mergeAliasMaps(currentAliases, inlineAlias)
+	joinAliases["this"] = &ast.Ident{Parts: []string{currentTable}}
+	joinAliases["that"] = &ast.Ident{Parts: []string{inlineName}}
 	onSQL := exprSQLWithAliases(join1.On, joinAliases, dialect)
+	onSQL = strings.ReplaceAll(onSQL, "this.", currentTable+".")
+	onSQL = strings.ReplaceAll(onSQL, "that.", inlineName+".")
 	selectCols, selNames := selectColumnsForCTE(sel2, joinAliases, joinName, false, currentTable, false, dialect)
 	withParts = append(withParts, buildCTESelect(joinName, currentTable, selectCols, fmt.Sprintf("    LEFT OUTER JOIN %s ON %s", inlineName, onSQL)))
 	currentTable = joinName
@@ -3273,7 +3331,14 @@ func compileSortAliasInlineSources(q *ast.Query, dialect *Dialect) (string, erro
 	inlineAlias2 := makeSimpleAliasMap(inlineName2, inlineCols2)
 
 	finalAliases := mergeAliasMaps(currentAliases, inlineAlias2)
-	finalOn := exprSQLWithAliases(join2.On, finalAliases, dialect)
+	finalAliases["this"] = &ast.Ident{Parts: []string{currentTable}}
+	finalAliases["that"] = &ast.Ident{Parts: []string{inlineName2}}
+	finalOn := exprSQLWithAliases(join2.On, map[string]ast.Expr{
+		"this": &ast.Ident{Parts: []string{currentTable}},
+		"that": &ast.Ident{Parts: []string{inlineName2}},
+	}, dialect)
+	finalOn = strings.ReplaceAll(finalOn, "this.", currentTable+".")
+	finalOn = strings.ReplaceAll(finalOn, "that.", inlineName2+".")
 	finalCols := selectColumnsForFinal(sel3, finalAliases, dialect)
 
 	var sb strings.Builder

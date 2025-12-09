@@ -5,3 +5,7 @@ coverage*.out
 .DS_Store
 vendor/
 tmp/
+
+
+CLAUDE.md
+AGENTS.md

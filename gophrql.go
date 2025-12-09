@@ -67,17 +67,22 @@ func Compile(prql string, opts ...Option) (string, error) {
 	}
 
 	// Target in PRQL file overrides option, but we align them
+	targetFromQuery := false
 	if tq.Target != "" {
 		options.Target = tq.Target
+		targetFromQuery = true
 	}
 
 	// Resolve dialect from target if provided
 	if options.Target != "" {
-		if d := sqlgen.GetDialect(options.Target); d != nil {
+		d := sqlgen.GetDialect(options.Target)
+		if d != nil {
 			options.Dialect = d
-		} else {
-			// Warn or error? For now, fallback to default but maybe we should error if explicit target unknown
-			// return "", fmt.Errorf("unsupported target %q", options.Target)
+		} else if targetFromQuery {
+			return "", fmt.Errorf("unsupported target %q", options.Target)
+		}
+		if targetFromQuery && !strings.EqualFold(options.Target, "sql.generic") {
+			return "", fmt.Errorf("unsupported target %q", options.Target)
 		}
 	}
 

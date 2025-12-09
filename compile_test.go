@@ -450,19 +450,18 @@ filter true
 select d = 10
 `,
 			wantSQL: `
-WITH pipe_0 AS (
+WITH table_1 AS (
   SELECT
-    *
+    NULL
   FROM
     genres
   LIMIT
     10
-),
-pipe_1 AS (
+), table_0 AS (
   SELECT
-    *
+    NULL
   FROM
-    pipe_0
+    table_1
   WHERE
     true
   LIMIT
@@ -471,7 +470,7 @@ pipe_1 AS (
 SELECT
   10 AS d
 FROM
-  pipe_1
+  table_0
 WHERE
   true
 `,
@@ -1388,20 +1387,14 @@ group {a.album_id, a.title} (
 sort album_id
 `,
 			wantSQL: `
-WITH pipe_0 AS (
+WITH table_0 AS (
   SELECT
-    *
+    album_id,
+    title
   FROM
     albums AS a
   LIMIT
     10
-),
-table_0 AS (
-  SELECT
-    a.album_id,
-    a.title
-  FROM
-    pipe_0
 )
 SELECT
   table_0.album_id,
