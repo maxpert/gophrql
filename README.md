@@ -10,6 +10,39 @@
 
 PRQL is a modern language for transforming data — a simple, powerful, pipelined SQL replacement. Like SQL, it's readable, explicit and declarative. Unlike SQL, it forms a logical pipeline of transformations, and supports abstractions such as variables and functions.
 
+## PRQL Language Overview
+
+PRQL queries are pipelines of transformations, where each line transforms the result of the previous line:
+
+```prql
+from employees              # Start with a table
+filter department == "Sales"  # Filter rows
+derive {                    # Add computed columns
+  monthly_salary = salary / 12,
+  annual_bonus = salary * 0.1
+}
+select {                    # Choose columns
+  first_name,
+  last_name, 
+  monthly_salary,
+  annual_bonus
+}
+sort {-monthly_salary}      # Sort descending by monthly_salary
+take 20                     # Limit results
+```
+
+### Key Features
+
+- **Pipelines**: `|` chains transformations (optional, newlines also work)
+- **Variables**: Define reusable expressions with `let`
+- **Functions**: Create custom transformations
+- **Dates**: First-class date support with `@2024-01-01` syntax
+- **F-strings**: String interpolation with `f"{first_name} {last_name}"`
+- **S-strings**: SQL escape hatch with `s"UPPER(name)"`
+- **Comments**: `#` for single-line comments
+
+For the complete language reference, visit [PRQL Book](https://prql-lang.org/book/).
+
 ## Features
 
 - ✅ **Full PRQL Syntax Support** - Implements the PRQL language spec
@@ -145,6 +178,87 @@ sql, _ := gophrql.Compile(prql)
 ## Extensibility: Custom Backends
 
 One of gophrql's unique features is exposing the parse tree, allowing you to build custom backends for non-SQL databases. Here's a basic example converting PRQL syntax to a MongoDB aggregation pipeline:
+
+### DuckDB Analytics Demo
+
+Here's a real-world time series analytics query transpiled to DuckDB, based on actual user workflows from the data community. This example analyzes cryptocurrency OHLCV data with moving averages and rolling statistics:
+
+```go
+package main
+
+import (
+    "fmt"
+    "github.com/maxpert/gophrql"
+)
+
+func main() {
+    prql := `
+        # Time series analysis with rolling windows and aggregations
+        from ohlcv_data
+        filter s"date_part(['year', 'month'], time) = {year: 2021, month: 2}"
+        
+        # Calculate moving averages and rolling statistics
+        window rolling:28 (
+            derive {
+                ma_28d = average close,
+                volatility_28d = stddev close
+            }
+        )
+        
+        # Calculate expanding cumulative average
+        window rows:..0 (
+            derive {
+                expanding_avg = average close,
+                cumulative_volume = sum volume
+            }
+        )
+        
+        # Combine rolling aggregations for Bollinger Bands
+        window rows:-15..14 (
+            derive {
+                rolling_mean = average close,
+                rolling_std = stddev close,
+                upper_band = average close + 2 * stddev close,
+                lower_band = average close - 2 * stddev close
+            }
+        )
+        
+        # Final selection with technical indicators
+        select {
+            time,
+            close,
+            ma_28d,
+            expanding_avg,
+            volatility_28d,
+            rolling_mean,
+            upper_band,
+            lower_band,
+            volume,
+            cumulative_volume
+        }
+        sort time
+        take 10
+    `
+    
+    sql, err := gophrql.Compile(prql, gophrql.WithTarget("sql.duckdb"))
+    if err != nil {
+        panic(err)
+    }
+    
+    fmt.Println(sql)
+    // Output: Optimized DuckDB query with window functions,
+    // perfect for financial analysis and time series workloads
+}
+```
+
+This demonstrates gophrql's ability to handle:
+- **Time series filtering** with DuckDB's date functions
+- **Window functions** for moving averages and rolling statistics
+- **Multiple window frames** (rolling, expanding, centered)
+- **Technical indicators** like Bollinger Bands and volatility
+- **Complex analytics** common in financial data analysis
+
+Based on real user workflows from [eitsupi/querying-with-prql](https://github.com/eitsupi/querying-with-prql), this example shows how PRQL simplifies complex time series analytics that would be verbose in raw SQL.
 
 ### MongoDB Example
 
