@@ -927,24 +927,27 @@ func (p *Parser) parseSortItem() (ast.SortItem, error) {
 }
 
 // Expression parsing (Pratt-style with limited operators).
+// Precedence follows PRQL spec: higher number = tighter binding
+// || (or) < && (and) < coalesce/?? < compare < add < mul < pow
 var precedences = map[TokenType]int{
 	OROR:     1,
-	EQ:       2,
-	REGEXEQ:  2,
-	NEQ:      2,
-	NULLCOAL: 2,
-	RANGE:    2,
-	LT:       3,
-	GT:       3,
-	LTE:      3,
-	GTE:      3,
-	PLUS:     4,
-	MINUS:    4,
-	STAR:     5,
-	SLASH:    5,
-	FLOORDIV: 5,
-	PERCENT:  5,
-	POW:      6,
+	ANDAND:   2,
+	EQ:       3,
+	REGEXEQ:  3,
+	NEQ:      3,
+	NULLCOAL: 3,
+	RANGE:    3,
+	LT:       4,
+	GT:       4,
+	LTE:      4,
+	GTE:      4,
+	PLUS:     5,
+	MINUS:    5,
+	STAR:     6,
+	SLASH:    6,
+	FLOORDIV: 6,
+	PERCENT:  6,
+	POW:      7,
 }
 
 func (p *Parser) parseExpr(precedence int) (ast.Expr, error) {
@@ -1055,6 +1058,13 @@ func (p *Parser) parsePrefix() (ast.Expr, error) {
 			return nil, err
 		}
 		return &ast.Binary{Op: "*", Left: &ast.Number{Value: "-1"}, Right: expr}, nil
+	case NOT:
+		// Unary NOT operator: !expr
+		expr, err := p.parseExpr(precedences[POW]) // High precedence for tight binding
+		if err != nil {
+			return nil, err
+		}
+		return &ast.Unary{Op: "!", Expr: expr}, nil
 	default:
 		return nil, fmt.Errorf("unexpected token %v at pos %d", tok, p.pos-1)
 	}

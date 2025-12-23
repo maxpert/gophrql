@@ -39,6 +39,8 @@ const (
 	RANGE    = ".."
 	NULLCOAL = "??"
 	OROR     = "||"
+	ANDAND   = "&&"
+	NOT      = "!"
 	ARROW    = "=>"
 	EQ       = "=="
 	NEQ      = "!="
@@ -232,6 +234,11 @@ func Lex(input string) ([]Token, error) {
 			i += 2
 			continue
 		}
+		if strings.HasPrefix(input[i:], "&&") {
+			tokens = append(tokens, Token{Typ: ANDAND, Lit: "&&"})
+			i += 2
+			continue
+		}
 		if strings.HasPrefix(input[i:], "==") {
 			tokens = append(tokens, Token{Typ: EQ, Lit: "=="})
 			i += 2
@@ -301,6 +308,8 @@ func Lex(input string) ([]Token, error) {
 			tokens = append(tokens, Token{Typ: LT, Lit: "<"})
 		case '>':
 			tokens = append(tokens, Token{Typ: GT, Lit: ">"})
+		case '!':
+			tokens = append(tokens, Token{Typ: NOT, Lit: "!"})
 		default:
 			return nil, fmt.Errorf("unexpected character %q", ch)
 		}

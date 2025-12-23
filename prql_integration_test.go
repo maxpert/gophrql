@@ -292,6 +292,78 @@ FROM
 	}
 }
 
+// TestPrqlOperators tests all PRQL operators comprehensively
+// Reference: PRQL operator precedence table from operators.md
+func TestPrqlOperators(t *testing.T) {
+	cases := []struct {
+		name    string
+		prql    string
+		wantErr bool
+		errMsg  string // expected error message substring
+	}{
+		// Comparison operators (all implemented)
+		{name: "op_eq", prql: "from t\nfilter a == 1", wantErr: false},
+		{name: "op_neq", prql: "from t\nfilter a != 1", wantErr: false},
+		{name: "op_lt", prql: "from t\nfilter a < 1", wantErr: false},
+		{name: "op_gt", prql: "from t\nfilter a > 1", wantErr: false},
+		{name: "op_lte", prql: "from t\nfilter a <= 1", wantErr: false},
+		{name: "op_gte", prql: "from t\nfilter a >= 1", wantErr: false},
+
+		// Arithmetic operators (all implemented)
+		{name: "op_add", prql: "from t\nderive x = a + 1", wantErr: false},
+		{name: "op_sub", prql: "from t\nderive x = a - 1", wantErr: false},
+		{name: "op_mul", prql: "from t\nderive x = a * 2", wantErr: false},
+		{name: "op_div", prql: "from t\nderive x = a / 2", wantErr: false},
+		{name: "op_mod", prql: "from t\nderive x = a % 2", wantErr: false},
+		{name: "op_pow", prql: "from t\nderive x = a ** 2", wantErr: false},
+		{name: "op_floor_div", prql: "from t\nderive x = a // 2", wantErr: false},
+
+		// Logical operators
+		{name: "op_or", prql: "from t\nfilter a == 1 || b == 2", wantErr: false},
+		{name: "op_and", prql: "from t\nfilter a == 1 && b == 2", wantErr: false},
+		{name: "op_not", prql: "from t\nfilter !active", wantErr: false},
+
+		// Other operators
+		{name: "op_coalesce", prql: "from t\nderive x = a ?? 0", wantErr: false},
+		{name: "op_regex", prql: "from t\nfilter name ~= \"foo\"", wantErr: false},
+		{name: "op_range", prql: "from t\ntake 5..10", wantErr: false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := gophrql.Compile(tc.prql)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Expected error for %s but compilation succeeded", tc.name)
+				}
+				if tc.errMsg != "" && !contains(err.Error(), tc.errMsg) {
+					t.Fatalf("Expected error containing %q, got: %v", tc.errMsg, err)
+				}
+				t.Logf("Expected error for %s: %v", tc.name, err)
+				return
+			}
+			if err != nil {
+				t.Fatalf("Unexpected error for %s: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && searchSubstr(s, substr)))
+}
+
+func searchSubstr(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
 // TestPrqlIntegrationNotYetImplemented tests features that are not yet implemented
 // These tests are expected to fail and serve as a roadmap for implementation
 func TestPrqlIntegrationNotYetImplemented(t *testing.T) {
@@ -378,12 +450,28 @@ take 5..
 			wantErr: true, // Range syntax not fully implemented
 		},
 		{
+			name: "and_operator",
+			prql: `
+from employees
+filter first_name == "John" && last_name == "Doe"
+`,
+			wantErr: false, // && operator now implemented
+		},
+		{
+			name: "not_operator",
+			prql: `
+from employees
+filter !is_active
+`,
+			wantErr: false, // ! (NOT) operator now implemented
+		},
+		{
 			name: "null_check",
 			prql: `
 from employees
 filter first_name == null && null == last_name
 `,
-			wantErr: true, // == null syntax not implemented
+			wantErr: false, // == null AND && both work now
 		},
 		{
 			name: "in_operator",

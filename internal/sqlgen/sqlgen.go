@@ -876,6 +876,8 @@ func collectExprNames(e ast.Expr, seen map[string]bool, names *[]string, inFunc 
 	case *ast.Binary:
 		collectExprNames(v.Left, seen, names, false)
 		collectExprNames(v.Right, seen, names, false)
+	case *ast.Unary:
+		collectExprNames(v.Expr, seen, names, false)
 	case *ast.Call:
 		collectExprNames(v.Func, seen, names, true)
 		for i := range v.Args {
@@ -950,6 +952,8 @@ func renameExpr(e ast.Expr, mapping map[string]string, inFunc bool) {
 	case *ast.Binary:
 		renameExpr(v.Left, mapping, false)
 		renameExpr(v.Right, mapping, false)
+	case *ast.Unary:
+		renameExpr(v.Expr, mapping, false)
 	case *ast.Call:
 		renameExpr(v.Func, mapping, true)
 		for i := range v.Args {
@@ -1022,6 +1026,8 @@ func cloneExpr(e ast.Expr) ast.Expr {
 		return &ast.StringLit{Value: v.Value}
 	case *ast.Binary:
 		return &ast.Binary{Op: v.Op, Left: cloneExpr(v.Left), Right: cloneExpr(v.Right)}
+	case *ast.Unary:
+		return &ast.Unary{Op: v.Op, Expr: cloneExpr(v.Expr)}
 	case *ast.Call:
 		args := make([]ast.Expr, len(v.Args))
 		for i := range v.Args {
@@ -2613,6 +2619,9 @@ func exprSQLInternal(v ast.Expr, aliases map[string]ast.Expr, seen map[string]bo
 		if v.Op == "||" {
 			return fmt.Sprintf("%s OR %s", exprSQLInternal(v.Left, aliases, seen, dialect), exprSQLInternal(v.Right, aliases, seen, dialect))
 		}
+		if v.Op == "&&" {
+			return fmt.Sprintf("%s AND %s", exprSQLInternal(v.Left, aliases, seen, dialect), exprSQLInternal(v.Right, aliases, seen, dialect))
+		}
 		if v.Op == "??" {
 			return fmt.Sprintf("COALESCE(%s, %s)", exprSQLInternal(v.Left, aliases, seen, dialect), exprSQLInternal(v.Right, aliases, seen, dialect))
 		}
@@ -2648,6 +2657,11 @@ func exprSQLInternal(v ast.Expr, aliases map[string]ast.Expr, seen map[string]bo
 			op = "<>"
 		}
 		return fmt.Sprintf("%s %s %s", exprSQLInternal(v.Left, aliases, seen, dialect), op, exprSQLInternal(v.Right, aliases, seen, dialect))
+	case *ast.Unary:
+		if v.Op == "!" {
+			return fmt.Sprintf("NOT %s", exprSQLInternal(v.Expr, aliases, seen, dialect))
+		}
+		return fmt.Sprintf("%s%s", v.Op, exprSQLInternal(v.Expr, aliases, seen, dialect))
 	case *ast.Call:
 		fn := identName(v.Func)
 		if dialect != nil {
@@ -3622,6 +3636,8 @@ func collectAliasFields(e ast.Expr, alias string, dst map[string]bool) {
 	case *ast.Binary:
 		collectAliasFields(v.Left, alias, dst)
 		collectAliasFields(v.Right, alias, dst)
+	case *ast.Unary:
+		collectAliasFields(v.Expr, alias, dst)
 	case *ast.Call:
 		collectAliasFields(v.Func, alias, dst)
 		for _, a := range v.Args {
@@ -3649,6 +3665,8 @@ func collectAliasFieldsOrdered(e ast.Expr, alias string, add func(string)) {
 	case *ast.Binary:
 		collectAliasFieldsOrdered(v.Left, alias, add)
 		collectAliasFieldsOrdered(v.Right, alias, add)
+	case *ast.Unary:
+		collectAliasFieldsOrdered(v.Expr, alias, add)
 	case *ast.Call:
 		collectAliasFieldsOrdered(v.Func, alias, add)
 		for _, a := range v.Args {

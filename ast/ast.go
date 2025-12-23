@@ -126,6 +126,10 @@ type (
 		Left  Expr
 		Right Expr
 	}
+	Unary struct {
+		Op   string
+		Expr Expr
+	}
 	Call struct {
 		Func Expr
 		Args []Expr
@@ -151,6 +155,7 @@ func (*Ident) isExpr()     {}
 func (*Number) isExpr()    {}
 func (*StringLit) isExpr() {}
 func (*Binary) isExpr()    {}
+func (*Unary) isExpr()     {}
 func (*Call) isExpr()      {}
 func (*Pipe) isExpr()      {}
 func (*CaseExpr) isExpr()  {}
